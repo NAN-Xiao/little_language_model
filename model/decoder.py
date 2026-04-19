@@ -1,10 +1,21 @@
 """
-Decoder — 堆叠多个 DecoderBlock, 逐层提取越来越抽象的特征
-============================================================
+Decoder — 自回归语言模型的核心：逐层提取越来越抽象的上下文特征
+================================================================
 
-这是 Decoder-Only 架构 (GPT/Llama/Qwen 风格), 只有自注意力, 没有交叉注意力。
+这是 Decoder-Only 架构 (GPT/Llama/Qwen 风格)。
+只有自注意力 (每个 token 看自己和之前的 token), 没有交叉注意力。
 
 默认配置: d_model=768, n_heads=12, n_layers=10, d_ff=3072, max_seq_len=256
+
+整体结构:
+  token_ids → Embedding → 位置编码 → 10层DecoderBlock → LayerNorm → hidden
+
+  每一层 DecoderBlock 内部:
+    x → LayerNorm → Masked Self-Attention → 残差(+)
+      → LayerNorm → FFN (或 MoE FFN)     → 残差(+)
+      → 输出
+
+  形状始终是 (B, seq, 768), 但每个 token 的表示越来越"懂"上下文。
 """
 
 from __future__ import annotations
@@ -20,57 +31,125 @@ from .positional import SinusoidalPositionalEncoding
 
 class DecoderBlock(nn.Module):
     """
-    单个 Transformer 解码器块 — 注意力 + FFN, 各带残差连接和 LayerNorm。
+    单个 Transformer 解码器块。
 
     ┌──────────────────────────────────────────────────────────────────┐
-    │  完整流程 (B=2, seq=5, d_model=768):                            │
+    │  数学原理                                                       │
     │                                                                  │
-    │  输入 x: (2, 5, 768)                                            │
-    │      │                                                           │
-    │      ├──────────────────────(+)──→ x_after_attn: (2, 5, 768)    │
-    │      │                           ↑                               │
-    │      │   norm1(x) → (2,5,768)    │                               │
-    │      │      │                     │                               │
-    │      │      ▼ Masked Self-Attn    │                               │
-    │      │   (2,5,768) → (2,5,768)───┘                               │
-    │      │      (q=k=v=normed, mask=因果掩码)                       │
-    │      │      + dropout                                            │
-    │      │                                                           │
-    │      ├──────────────────────(+)──→ 输出: (2, 5, 768)            │
-    │      │                           ↑                               │
-    │      │ norm2(x_after_attn)        │                               │
-    │      │      │                     │                               │
-    │      │      ▼ FFN / MoE FFN      │                               │
-    │      │   (2,5,768)→(2,5,3072)    │                               │
-    │      │   →(2,5,768)──────────────┘                               │
-    │      │      + dropout                                            │
+    │  原始 Transformer 论文 (Post-Norm):                             │
+    │    x = LayerNorm(x + Attention(x))                              │
+    │    x = LayerNorm(x + FFN(x))                                    │
     │                                                                  │
-    │  ┌──────────────────────────────────────────────────┐            │
-    │  │  两个关键设计:                                    │            │
-    │  │                                                    │            │
-    │  │  Pre-Norm (先归一化再计算):                       │            │
-    │  │    x = x + Attn(norm(x))                          │            │
-    │  │    而不是 Post-Norm: x = norm(x + Attn(x))        │            │
-    │  │    Pre-Norm 训练更稳定, 梯度流动更顺畅           │            │
-    │  │                                                    │            │
-    │  │  残差连接 (+):                                     │            │
-    │  │    把输入直接加到输出上                            │            │
-    │  │    好处: 梯度可以直接跳过这一层回传,              │            │
-    │  │          即使这一层没学到东西(输出≈0),            │            │
-    │  │          梯度也不会消失, 训练深层网络不会崩      │            │
-    │  └──────────────────────────────────────────────────┘            │
+    │  本项目使用 Pre-Norm (GPT-2之后的主流):                         │
+    │    x = x + Attention(LayerNorm(x))                              │
+    │    x = x + FFN(LayerNorm(x))                                    │
     │                                                                  │
-    │  ┌──────────────────────────────────────────────────┐            │
-    │  │  为什么用 LayerNorm 而不是 BatchNorm?             │            │
-    │  │                                                    │            │
-    │  │  BatchNorm: 对整个 batch 统计均值方差             │            │
-    │  │    → NLP 的 batch 通常很小 (4~16), 统计不稳定    │            │
-    │  │    → 序列长度不同时, padding 影响统计            │            │
-    │  │                                                    │            │
-    │  │  LayerNorm: 对单个 token 的 768 维统计            │            │
-    │  │    → 不依赖 batch 大小 ✓                          │            │
-    │  │    → 每个 token 独立归一化 ✓                      │            │
-    │  └──────────────────────────────────────────────────┘            │
+    │  Pre-Norm 为什么更好?                                            │
+    │    Post-Norm: 残差加完后才归一化 → 深层梯度可能爆炸/消失       │
+    │    Pre-Norm:  先归一化再进子层 → 输入直接通过残差跳到输出      │
+    │               → 梯度可以沿残差路径无衰减地传回第1层             │
+    │               → 训练 10 层、100 层都不会崩                      │
+    │                                                                  │
+    │  残差连接 (x + ...) 的数学意义:                                 │
+    │    没有 +x: 子层必须学出完整的变换 f(x)                         │
+    │    有  +x:  子层只需要学残差 Δx = f(x) - x                    │
+    │             如果这层没用, Δx≈0, 输出≈x, 信息无损通过          │
+    │             梯度: ∂(x + f(x))/∂x = 1 + ∂f/∂x ≥ 1             │
+    │             梯度永远≥1, 不会消失                                │
+    │                                                                  │
+    ├──────────────────────────────────────────────────────────────────┤
+    │  完整维度流转 (B=2, seq=5, d_model=768, n_heads=12, d_k=64)    │
+    │                                                                  │
+    │  输入 x: (2, 5, 768)                                           │
+    │                                                                  │
+    │  ═══ 子层1: Masked Self-Attention ═══                            │
+    │                                                                  │
+    │  norm1 = LayerNorm(x)                                           │
+    │    LayerNorm 做什么?                                             │
+    │      对每个 token 的 768 维独立归一化:                           │
+    │      out = (x - mean) / √(var + ε) × γ + β                    │
+    │      mean, var: 该 token 768维的均值方差                        │
+    │      ε=1e-5: 防除零                                            │
+    │      γ, β: 可学习参数, 初始γ=1, β=0 (即初始时归一化)          │
+    │    → (2, 5, 768) 形状不变, 值域归到接近 0 均值 1 方差         │
+    │                                                                  │
+    │  attn_out = MultiHeadAttention(normed, normed, normed, mask)    │
+    │    自注意力: q = k = v = normed (同一个输入三个角色)             │
+    │    mask = 因果掩码 (下三角, 只看过去)                           │
+    │                                                                  │
+    │    内部维度展开:                                                 │
+    │      w_q(normed):   (2,5,768) @ (768,768) → (2,5,768)          │
+    │        Linear 就是矩阵乘法: y = x @ W^T + b                    │
+    │        W 形状: (768, 768), b 形状: (768,)                       │
+    │        把 768 维映射到 768 维 (只是换了表示空间)                │
+    │      .view(2,5,12,64): 把 768 拆成 12头 × 64维/头              │
+    │        768 = 12 × 64, 只是换视角看同一组数                     │
+    │      .transpose(1,2): (2,12,5,64)                                │
+    │        把头维提前, 后面每个头独立算注意力                       │
+    │                                                                  │
+    │      q: (2,12,5,64)  k: (2,12,5,64)  v: (2,12,5,64)           │
+    │                                                                  │
+    │      [可选] RoPE: q,k = rope(q,k)                               │
+    │        旋转后形状不变: (2,12,5,64) → (2,12,5,64)               │
+    │        注入位置信息, 让注意力感知 token 距离                    │
+    │                                                                  │
+    │      scores = q @ k^T / √64:                                     │
+    │        (2,12,5,64) @ (2,12,64,5) → (2,12,5,5)                   │
+    │        每个 token 对 5 个 token 的注意力分数                    │
+    │        除以 √64=8: 防止分数太大导致 softmax 饱和               │
+    │                                                                  │
+    │      mask: 因果掩码 (2,1,5,5)                                    │
+    │        [1 0 0 0 0]                                               │
+    │        [1 1 0 0 0]                                               │
+    │        [1 1 1 0 0]                                               │
+    │        [1 1 1 1 0]                                               │
+    │        [1 1 1 1 1]                                               │
+    │        0 的位置填 -inf → softmax 后变 0 → 看不到未来           │
+    │        中间的 1 广播到 12 个头 (所有头共享同一个 mask)          │
+    │                                                                  │
+    │      weights = softmax(scores, dim=-1): (2,12,5,5)               │
+    │        每行概率和=1: token2 的权重 [0.3, 0.4, 0.3, 0, 0]     │
+    │                                                                  │
+    │      out = weights @ v: (2,12,5,64)                              │
+    │        每个 token 的输出 = 所有关注 token 值的加权平均          │
+    │                                                                  │
+    │      拼回: .transpose(1,2) → .view → (2,5,768)                  │
+    │        12个头的64维结果按顺序接起来 = 768维                     │
+    │      w_o: (2,5,768) → (2,5,768)                                 │
+    │        输出投影: 融合各头信息                                    │
+    │                                                                  │
+    │  x = x + dropout(attn_out)                                       │
+    │    残差连接: 原始 x + 注意力输出                                 │
+    │    dropout: 训练时随机丢弃部分值, 防过拟合                       │
+    │    → (2, 5, 768)                                                │
+    │                                                                  │
+    │  ═══ 子层2: FFN ═══                                              │
+    │                                                                  │
+    │  norm2 = LayerNorm(x)   → (2, 5, 768)                           │
+    │                                                                  │
+    │  ffn_out = FFN(norm2):                                           │
+    │    Linear(768→3072):  (2,5,768) → (2,5,3072)                    │
+    │      为什么768→3072? 升维4倍, 在高维空间做非线性变换            │
+    │      单层768→768只有线性变换, 升维+激活才有非线性表达力          │
+    │    ReLU:                (2,5,3072) → (2,5,3072)                  │
+    │      负数变0, 引入非线性; 约50%神经元被关掉, 防止过拟合         │
+    │    Dropout:              (2,5,3072)                               │
+    │    Linear(3072→768):    (2,5,3072) → (2,5,768)                  │
+    │      降维回来, 输出和输入同形状                                 │
+    │    Dropout:              (2,5,768)                                │
+    │                                                                  │
+    │    或者 MoE FFN (use_moe=True):                                   │
+    │      有4个专家FFN, 每个token只用1个:                             │
+    │      router(token) → 选专家i → 专家i的FFN(token)                │
+    │      维度变化和普通FFN一样: 768→3072→768                        │
+    │      好处: 参数4倍, 但每次只算1倍, 省计算                      │
+    │                                                                  │
+    │  x = x + dropout(ffn_out)                                        │
+    │    残差连接: 原始 x + FFN 输出                                   │
+    │    → (2, 5, 768) — 一个 DecoderBlock 结束                       │
+    │                                                                  │
+    │  总结: 进(2,5,768), 出(2,5,768), 形状永远不变                  │
+    │  但每个token从"只知道自己"变成"知道所有历史token的信息"         │
     └──────────────────────────────────────────────────────────────────┘
     """
 
@@ -86,10 +165,12 @@ class DecoderBlock(nn.Module):
         max_seq_len: int = 8192,
     ):
         super().__init__()
+        # 掩码自注意力: 每个token只看自己和之前的token
         self.masked_self_attn = MultiHeadAttention(
             d_model, n_heads, dropout,
             use_rope=use_rope, max_seq_len=max_seq_len,
         )
+        # FFN: 二选一 — 普通FFN 或 MoE FFN
         self.ffn = (
             MoEFeedForward(d_model, d_ff, moe_num_experts, dropout)
             if use_moe
@@ -106,10 +187,11 @@ class DecoderBlock(nn.Module):
         tgt_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """(B, seq, d_model) → (B, seq, d_model)"""
-        # 自注意力: q=k=v=归一化后的x, 只看过去 (因果掩码)
+        # Pre-Norm + 残差: x + Attn(norm(x))
         normed = self.norm1(x)
+        
         x = x + self.dropout1(self.masked_self_attn(normed, normed, normed, tgt_mask))
-        # FFN: 逐位置做非线性变换
+        # Pre-Norm + 残差: x + FFN(norm(x))
         normed = self.norm2(x)
         x = x + self.dropout2(self.ffn(normed))
         return x
@@ -117,40 +199,72 @@ class DecoderBlock(nn.Module):
 
 class Decoder(nn.Module):
     """
-    Decoder 堆叠 — Embedding + 位置编码 + N 层 DecoderBlock + 最终 LayerNorm。
+    Decoder 堆叠: token id → Embedding → 位置编码 → N层DecoderBlock → LayerNorm → hidden
 
     ┌──────────────────────────────────────────────────────────────────┐
-    │  完整流程 (B=2, seq=5, 默认配置):                               │
+    │  完整维度流转 (B=2, seq=5, vocab=68, 默认配置):                 │
     │                                                                  │
-    │  输入: token_ids (2, 5) — 5 个 token 的 id                     │
-    │      │                                                           │
-    │      ▼ Embedding(68, 768): 查表, 把 id 变成向量                │
-    │  (2, 5, 768)                                                    │
-    │      │                                                           │
-    │      ▼ × √768 ≈ 27.7: 缩放 embedding                           │
-    │  (2, 5, 768) — 为什么要缩放?                                    │
-    │    embedding 初始化值很小 (~1/√768 ≈ 0.036)                    │
-    │    乘以 √768 后值域接近 1, 和位置编码量级匹配                   │
-    │    不缩放的话位置编码会盖过语义信息                             │
-    │      │                                                           │
-    │      ▼ 位置编码 (二选一):                                       │
+    │  输入: token_ids (2, 5) — 5个token的id                         │
+    │    例如: [[3, 12, 45, 7, 2],                                    │
+    │           [8, 3, 12, 0, 0]]                                     │
+    │    第2个样本末尾2个pad(id=0)                                    │
     │                                                                  │
-    │    use_rope=False:                                               │
-    │      x = x + SinusoidalPE(pos) → (2, 5, 768)                   │
-    │      在入口加一次位置编码, 之后不再注入                         │
+    │  ── Step 1: Token Embedding ─────────────────────────────────    │
     │                                                                  │
-    │    use_rope=True:                                                │
-    │      x = dropout(x)         → (2, 5, 768)                      │
-    │      不加位置编码, 每层 attention 内部旋转 Q,K                  │
+    │  Embedding(68, 768): 查表操作                                   │
+    │    有一个 (68, 768) 的查找表, 每行是一个token的向量             │
+    │    id=3  → 查第3行  → 768维向量, 如 [0.12, -0.03, ...]       │
+    │    id=12 → 查第12行 → 768维向量, 如 [0.44, 0.91, ...]        │
+    │    → (2, 5, 768)                                                │
     │                                                                  │
-    │      │                                                           │
-    │      ▼ DecoderBlock × 10: 逐层提取特征                         │
-    │    每层都是 (2, 5, 768) → (2, 5, 768), 形状不变               │
-    │    但每个 token 的表示越来越"懂"上下文                          │
+    │  × √768 ≈ 27.7: 缩放embedding                                  │
+    │    → (2, 5, 768)                                                │
+    │    为什么缩放?                                                   │
+    │      Embedding初始化: N(0, 1/√768) → 值约±0.04               │
+    │      位置编码值: sin/cos 输出约±1                               │
+    │      不缩放: 位置编码值 >> embedding值 → 语义被位置淹没        │
+    │      缩放后: embedding值约±1, 和位置编码同量级 → 两者平衡      │
+    │      为什么乘√d_model而不是别的?                                 │
+    │        原始Transformer论文的设定, 和点积注意力的缩放对应       │
     │                                                                  │
-    │      │                                                           │
-    │      ▼ LayerNorm(768): 最终归一化                               │
-    │    (2, 5, 768) — 稳定输出, 方便后续投影到词表                  │
+    │  ── Step 2: 位置编码 (二选一) ──────────────────────────────    │
+    │                                                                  │
+    │  use_rope=False (原始Transformer / GPT-2 风格):                 │
+    │    x = x + SinusoidalPE(pos) → (2, 5, 768)                     │
+    │                                                                  │
+    │    SinusoidalPE 做什么?                                          │
+    │      PE(pos, 2i)   = sin(pos / 10000^(2i/768))                 │
+    │      PE(pos, 2i+1) = cos(pos / 10000^(2i/768))                 │
+    │      对每个位置生成 768 维向量, 加到 token embedding 上         │
+    │      位置0: [sin(0), cos(0), sin(0), cos(0), ...] = [0,1,0,1,.]│
+    │      位置1: [sin(1), cos(1), sin(1/10000^...), ...]            │
+    │      不同位置的 sin/cos 值不同 → token有了位置信息              │
+    │      只在入口加一次, 后面10层不再注入 → 深层位置信息可能稀释  │
+    │                                                                  │
+    │  use_rope=True (Llama/Qwen 风格):                               │
+    │    x = dropout(x) → (2, 5, 768)                                 │
+    │    不加任何位置编码!                                             │
+    │    位置信息在每层attention内部通过旋转Q,K注入 (见positional.py)│
+    │    → 每层都重新注入 → 位置信息不会被稀释                       │
+    │    → 编码相对位置 ("我离你3步") 而非绝对位置 ("我在第5位")   │
+    │                                                                  │
+    │  ── Step 3: 10层 DecoderBlock ──────────────────────────────    │
+    │                                                                  │
+    │  每层: (2, 5, 768) → (2, 5, 768), 形状不变                    │
+    │                                                                  │
+    │  层数越多, token 的表示越"懂"上下文:                           │
+    │    第1层: token学到了相邻token的关系 (如"猫"和"吃")            │
+    │    第5层: token学到了短语级的关系 (如"猫吃"是一个主谓)         │
+    │    第10层: token学到了句子级的关系 (如整句是问句还是陈述)       │
+    │                                                                  │
+    │  ── Step 4: 最终 LayerNorm ─────────────────────────────────    │
+    │                                                                  │
+    │  LayerNorm(768): (2, 5, 768) → (2, 5, 768)                     │
+    │    稳定输出值域, 方便后续 Linear(768→68) 投影到词表            │
+    │    没有这个归一化, 不同位置的输出值域可能差异很大               │
+    │                                                                  │
+    │  总结: (2,5) → (2,5,768) → 10层不变 → (2,5,768)               │
+    │  每个 token 从一个 id 变成了融合了所有历史上下文的 768 维向量   │
     └──────────────────────────────────────────────────────────────────┘
     """
 
@@ -173,15 +287,20 @@ class Decoder(nn.Module):
         self.d_model = d_model
         self.use_rope = use_rope
 
+        # (68, 768) 的查找表, padding_idx=0 让 pad token 的梯度为0
         self.token_embedding = nn.Embedding(vocab_size, d_model, padding_idx=pad_token_id)
 
+        # 位置编码: 二选一
         if self.use_rope:
+            # RoPE模式: 不需要加法位置编码, 只保留dropout
             self.embed_dropout = nn.Dropout(dropout)
             self.pos_encoding = None
         else:
+            # 正弦编码模式: 在入口加一次
             self.pos_encoding = SinusoidalPositionalEncoding(d_model, max_seq_len, dropout)
             self.embed_dropout = None
 
+        # 10层 DecoderBlock
         self.layers = nn.ModuleList(
             [
                 DecoderBlock(
@@ -199,16 +318,19 @@ class Decoder(nn.Module):
         tgt: torch.Tensor,
         tgt_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """
-        token_ids: (B, seq) → hidden: (B, seq, d_model)
-        """
+        """token_ids: (B, seq) → hidden: (B, seq, d_model)"""
+        # Embedding + 缩放
         x = self.token_embedding(tgt) * (self.d_model**0.5)
 
+        # 位置编码
         if self.use_rope:
             x = self.embed_dropout(x)
         else:
             x = self.pos_encoding(x)
 
+        # 10层 DecoderBlock
         for layer in self.layers:
             x = layer(x, tgt_mask)
+
+        # 最终归一化
         return self.norm(x)

@@ -126,13 +126,62 @@ class MultiHeadAttention(nn.Module):
         │      即: 从其他 token 的"值"中, 按相关性提取信息               │
         └──────────────────────────────────────────────────────────────────┘
         """
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_k)
+        # ═══ Step 1: 计算 q·k^T — 每个 token 对每个 token 的原始分数 ═══
+        # q:   (B, 12, 5, 64)    ← 5个token的查询向量
+        # k^T: (B, 12, 64, 5)    ← 转置最后两维: 把 (5,64) 变成 (64,5)
+        # q @ k^T: (B, 12, 5, 5) ← 每个 token 对 5 个 token 的点积分数
+        #
+        # 点积的含义:
+        #   scores[b, h, i, j] = q[b,h,i] · k[b,h,j] = token_i 对 token_j 的原始注意力分数
+        #   点积越大 → 两个向量越"对齐" → token_i 越关注 token_j
+        #
+        # 为什么要转置 k?
+        #   矩阵乘法规则: (..., 5, 64) @ (..., 64, 5) → (..., 5, 5)
+        #   必须让 k 的 64 维和 q 的 64 维对齐才能相乘
+        scores = torch.matmul(q, k.transpose(-2, -1))
 
+        # ═══ Step 2: 缩放 — 除以 √d_k ═══
+        # scores / √64 = scores / 8
+        #
+        # 为什么必须缩放?
+        #   d_k=64 时, 点积 = 64 个乘积相加, 数值可能很大 (如 +50)
+        #   softmax(+50) ≈ 1.0, softmax(-50) ≈ 0.0
+        #   → 所有概率集中到1个位置, 其他位置梯度≈0 → 训练停滞
+        #   除以 √d_k 后分数缩小到合理范围 (如 ±6), softmax 梯度健康
+        scores = scores / math.sqrt(self.d_k)
+
+        # ═══ Step 3: 应用因果掩码 — 让 token 看不到未来 ═══
+        # mask 中 0 的位置 → 填 -inf → softmax 后变 0 → 不看
+        # mask 中 1 的位置 → 不变 → softmax 后正常参与
+        #
+        # 例: scores[mask=0处] = -inf
+        #   [2.1, -inf, -inf, -inf, -inf]   ← token0 只看 token0
+        #   [1.5,  0.8, -inf, -inf, -inf]   ← token1 看 token0,1
         if mask is not None:
             scores = scores.masked_fill(mask == 0, float("-inf"))
 
+        # ═══ Step 4: softmax — 把分数变成概率 (每行和=1) ═══
+        # dim=-1: 沿最后一个维度 (5个key) 做 softmax
+        #
+        # 例: token1 的分数 [1.5, 0.8, -inf, -inf, -inf]
+        #   softmax → [0.67, 0.33, 0, 0, 0]
+        #   → token1 有 67% 关注 token0, 33% 关注 token1, 不看未来
+        #
+        # 数学: softmax(x_i) = exp(x_i) / Σ exp(x_j)
+        #   -inf 的 exp = 0 → 被 mask 的位置概率为 0
         attn_weights = F.softmax(scores, dim=-1)
         attn_weights = self.dropout(attn_weights)
+
+        # ═══ Step 5: 加权求和 — 用注意力权重混合各 token 的值 ═══
+        # attn_weights: (B, 12, 5, 5)  ← 注意力概率矩阵
+        # v:            (B, 12, 5, 64) ← 每个 token 的值向量
+        # attn @ v:     (B, 12, 5, 64) ← 每个token的输出
+        #
+        # 例: token1 的输出
+        #   out₁ = 0.67 × V₀ + 0.33 × V₁ + 0×V₂ + 0×V₃ + 0×V₄
+        #   = 按"关注度"从其他 token 的值中提取信息的加权平均
+        #
+        # 这就是 Attention(Q,K,V) = softmax(QK^T/√d)·V 的完整计算!
         return torch.matmul(attn_weights, v)
 
     def forward(
@@ -186,21 +235,44 @@ class MultiHeadAttention(nn.Module):
         """
         batch_size = query.size(0)
 
-        # 线性投影 + 拆多头
-        q = self.w_q(query).view(batch_size, -1, self.n_heads, self.d_k).transpose(1, 2)
-        k = self.w_k(key).view(batch_size, -1, self.n_heads, self.d_k).transpose(1, 2)
-        v = self.w_v(value).view(batch_size, -1, self.n_heads, self.d_k).transpose(1, 2)
+        # ═══ 线性投影: 768→768, 把同一个输入投影成不同角色 ═══
+        # w_q/w_k/w_v 是三个不同的 Linear(768,768), 各自独立学习
+        # 输入相同, 但投影方向不同 → q/k/v 含义不同
+        # (B, seq, 768) → (B, seq, 768)
+        q = self.w_q(query)   # "我要找什么" — 查询
+        k = self.w_k(key)     # "我能提供什么" — 键
+        v = self.w_v(value)   # "我的实际内容" — 值
 
+        # ═══ 拆多头: 768 → 12头×64维 ═══
+        # 为什么能拆? 768 = 12 × 64, 只是换视角看同一组数
+        # (B, seq, 768) → (B, seq, 12, 64)
+        q = q.view(batch_size, -1, self.n_heads, self.d_k)
+        k = k.view(batch_size, -1, self.n_heads, self.d_k)
+        v = v.view(batch_size, -1, self.n_heads, self.d_k)
+
+        # ═══ 转置: 把头维提前, 方便每个头独立算注意力 ═══
+        # (B, seq, 12, 64) → (B, 12, seq, 64)
+        # 转置后, 第1维是头号, 每个头可以独立做 q@k^T
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        # ═══ 可选: RoPE 旋转位置编码 (拆多头之后才旋转) ═══
         if self.use_rope:
             q, k = self.rope(q, k, offset=rope_offset)
 
+        # ═══ 缩放点积注意力 ═══
         if mask is not None and mask.dim() == 3:
-            mask = mask.unsqueeze(1)  # (B, seq_q, seq_k) → (B, 1, seq_q, seq_k)
+            # (B, seq_q, seq_k) → (B, 1, seq_q, seq_k)
+            mask = mask.unsqueeze(1)
 
+        # scaled_dot_product_attention中就是 Attention(Q,K,V) = softmax(QK^T/√d)·V
         attn_output = self.scaled_dot_product_attention(q, k, v, mask)
 
-        # 拼回多头 + 输出投影
-        attn_output = (
-            attn_output.transpose(1, 2).contiguous().view(batch_size, -1, self.d_model)
-        )
+        # ═══ 拼回多头 + 输出投影 ═══
+        # (B, 12, seq, 64) → (B, seq, 12, 64) → (B, seq, 768)
+        attn_output = attn_output.transpose(1, 2)  # 头维放回 seq 后面
+        attn_output = attn_output.contiguous()      # 保证内存连续 (transpose后不连续)
+        attn_output = attn_output.view(
+            batch_size, -1, self.d_model)  # 12×64=768, 拼回
         return self.w_o(attn_output)

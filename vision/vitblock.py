@@ -117,14 +117,20 @@ class PatchEmbedding(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        x: (B, C, H, W) — 例如 (B, 3, 224, 224)
-        返回: (B, num_patches, d_model) — 例如 (B, 196, 768)
+        Args:
+            x: 输入张量，形状为 (B, C, H, W)，例如 (B, 3, 224, 224)
+        Returns:
+            输出张量，形状为 (B, num_patches, d_model)，例如 (B, 196, 768)
         """
-        # (B, d_model, H/P, W/P) 例如 (B, 768, 14, 14)
-        x = self.projection(x)
-        # flatten(2) 把空间维合并: (B, 768, 14, 14) → (B, 768, 196)
-        # transpose: (B, 768, 196) → (B, 196, 768) 即 (B, num_patches, d_model)
-        x = x.flatten(2).transpose(1, 2)
+
+        # 用卷积将每个 patch 映射到 d_model 维，输出形状: (B, d_model, H/P, W/P)，例如 (B, 768, 14, 14)
+        # transpose(1, 2) 交换第 1 维和第 2 维: (B, 768, 196) → (B, 196, 768)，即 (B, num_patches, d_model)
+        # 将空间维 (H/P, W/P) 展平成一个 patch 维度: (B, d_model, 14, 14) → (B, d_model, 196)
+        x = x.flatten(2)
+        # 交换 d_model 和 patch 维度，得到 (B, 196, 768)，即 (B, num_patches, d_model)
+        x = x.transpose(1, 2)
+        # 就是图像的embeding  和文字对齐的吗？
+        # 文字embeding的形状是
         return x
 
 
@@ -171,7 +177,8 @@ class ViTEncoderBlock(nn.Module):
         # --- 自注意力子层 ---
         normed = self.norm1(x)
         # query = key = value = normed → 自注意力，mask=None → 双向
-        x = x + self.dropout1(self.self_attn(normed, normed, normed, mask=None))
+        x = x + self.dropout1(self.self_attn(normed,
+                              normed, normed, mask=None))
 
         # --- 前馈网络子层 ---
         normed = self.norm2(x)
@@ -246,7 +253,8 @@ class VisionTransformer(nn.Module):
         # --- 可学习位置编码 ---
         # num_patches + 1 是因为要给 [CLS] 也分配一个位置编码
         # 与 positional.py 中的正弦编码不同，这里是全可学习的
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, cfg.d_model))
+        self.pos_embed = nn.Parameter(
+            torch.zeros(1, num_patches + 1, cfg.d_model))
 
         self.pos_drop = nn.Dropout(cfg.dropout)
 
@@ -291,7 +299,8 @@ class VisionTransformer(nn.Module):
         x = torch.cat([cls_tokens, x], dim=1)  # (B, 197, 768)
 
         # 3) 加上位置编码
-        x = x + self.pos_embed  # (B, 197, 768) + (1, 197, 768) → broadcast → (B, 197, 768)
+        # (B, 197, 768) + (1, 197, 768) → broadcast → (B, 197, 768)
+        x = x + self.pos_embed
         x = self.pos_drop(x)
 
         # 4) 通过 N 层 Encoder Block
@@ -448,7 +457,8 @@ class VisionLanguageModel(nn.Module):
            [1, 1, 1, 1, 0],
            [1, 1, 1, 1, 1]]
         """
-        mask = torch.tril(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool))
+        mask = torch.tril(torch.ones(seq_len, seq_len,
+                          device=device, dtype=torch.bool))
         return mask.unsqueeze(0).unsqueeze(0)  # (1, 1, S, S)
 
     def forward(
@@ -489,7 +499,8 @@ class VisionLanguageModel(nn.Module):
         # ---- 文本嵌入 ----
         # 直接复用 Decoder 的 token_embedding
         d_model = self.decoder.d_model
-        text_embeds = self.decoder.token_embedding(input_ids) * (d_model ** 0.5)
+        text_embeds = self.decoder.token_embedding(
+            input_ids) * (d_model ** 0.5)
         # (B, T, d_model)
 
         # ---- 拼接：[图像 tokens | 文本 tokens] ----
@@ -549,12 +560,14 @@ class VisionLanguageModel(nn.Module):
         image_embeds = self.projector(image_features)  # (B, N_img, d)
 
         generated = input_ids.clone()
-        finished = torch.zeros(input_ids.size(0), dtype=torch.bool, device=input_ids.device)
+        finished = torch.zeros(input_ids.size(
+            0), dtype=torch.bool, device=input_ids.device)
 
         for _ in range(max_new_tokens):
             # 文本嵌入
             d_model = self.decoder.d_model
-            text_embeds = self.decoder.token_embedding(generated) * (d_model ** 0.5)
+            text_embeds = self.decoder.token_embedding(
+                generated) * (d_model ** 0.5)
 
             # 拼接
             combined = torch.cat([image_embeds, text_embeds], dim=1)
@@ -569,15 +582,18 @@ class VisionLanguageModel(nn.Module):
             x = self.decoder.norm(x)
 
             # 只取最后一个位置的 logits
-            next_logits = self.output_proj(x[:, -1, :]) / max(temperature, 1e-5)
+            next_logits = self.output_proj(
+                x[:, -1, :]) / max(temperature, 1e-5)
 
             if top_k > 0:
-                top_k_vals, _ = torch.topk(next_logits, min(top_k, next_logits.size(-1)))
+                top_k_vals, _ = torch.topk(
+                    next_logits, min(top_k, next_logits.size(-1)))
                 next_logits[next_logits < top_k_vals[:, -1:]] = float("-inf")
 
             probs = F.softmax(next_logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)  # (B, 1)
-            next_token = next_token.masked_fill(finished.unsqueeze(1), self.pad_token_id)
+            next_token = next_token.masked_fill(
+                finished.unsqueeze(1), self.pad_token_id)
 
             generated = torch.cat([generated, next_token], dim=1)
             finished = finished | (next_token.squeeze(1) == eos_token_id)

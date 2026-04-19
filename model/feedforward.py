@@ -61,6 +61,8 @@ class PositionwiseFeedForward(nn.Module):
 
     def __init__(self, d_model: int, d_ff: int, dropout: float = 0.1):
         super().__init__()
+        # 两层 FFN: 升维 → 激活 → 降维
+        #  Sequential 按顺序串联多个层, 输入依次通过每层处理, 输出最后一层结果。
         self.net = nn.Sequential(
             nn.Linear(d_model, d_ff),   # (768 → 3072) 升维
             nn.ReLU(),                  # 非线性激活

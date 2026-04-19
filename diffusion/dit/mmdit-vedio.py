@@ -457,7 +457,7 @@ class STJointAttention(nn.Module):
         # 总结：输入一段视频（如24帧），经过 patch_t=2 切分后，nt=12，模型中每个 batch 样本
         # 会表示成 nt 个时间 patch，每个 patch 编码对应时间段的连续多帧内容（如patch_t=2即2帧合成1 patch）。
         """
-        #vid_spatial意思是把视频patch重组为 (B*nt, S, d)，即每一帧作为一个样本，方便每一帧与文本做联合注意力
+        # vid_spatial意思是把视频patch重组为 (B*nt, S, d)，即每一帧作为一个样本，方便每一帧与文本做联合注意力
         vid_spatial = vid.reshape(B, nt, S, d).reshape(B * nt, S, d)
 
         # Step 1.2: 文本特征扩张
@@ -467,13 +467,16 @@ class STJointAttention(nn.Module):
         # 做法体现了「空间」在于，空间注意力是对每一帧（时间patch）上的所有空间位置（S=nh*nw）和文本token（L）联合进行的，
         # 因此要把文本特征复制成与每一帧对应，然后空间联合。每帧对应S个patch，所有帧文本都一样——文本先扩张到 (B, nt, L, d)，
         # 再展平成 (B*nt, L, d)，便于和每一帧的所有空间patch一起送入空间联合注意力。
-        txt_spatial = txt.unsqueeze(1).expand(-1, nt, -1, -1).reshape(B * nt, L, d)
+        txt_spatial = txt.unsqueeze(
+            1).expand(-1, nt, -1, -1).reshape(B * nt, L, d)
 
         # Step 1.3: 分别生成Q、K、V（注意力的查询/键/值）
         # 生成每一帧空间patch的QKV
-        vq, vk, vv = [self._reshape_heads(x) for x in self.vid_qkv(vid_spatial).chunk(3, dim=-1)]
+        vq, vk, vv = [self._reshape_heads(
+            x) for x in self.vid_qkv(vid_spatial).chunk(3, dim=-1)]
         # 生成文本token的QKV
-        tq, tk, tv = [self._reshape_heads(x) for x in self.txt_qkv(txt_spatial).chunk(3, dim=-1)]
+        tq, tk, tv = [self._reshape_heads(
+            x) for x in self.txt_qkv(txt_spatial).chunk(3, dim=-1)]
 
         # Step 1.4: 拼接视频和文本QKV，做空间+文本联合注意力
         # 维度说明
@@ -518,14 +521,16 @@ class STJointAttention(nn.Module):
 
         # Step 2.3: 时间 self-attention 的QKV生成
         # 只对时间序列做注意力
-        tq, tk, tv = [self._reshape_heads(x) for x in self.temporal_qkv(vid_temporal).chunk(3, dim=-1)]
+        tq, tk, tv = [self._reshape_heads(x) for x in self.temporal_qkv(
+            vid_temporal).chunk(3, dim=-1)]
         # 时间轴 attention
         t_out = self._attention(tq, tk, tv)    # (B*S, n_heads, nt, d_k)
         t_out = t_out.transpose(1, 2).reshape(B * S, nt, d)
 
         # Step 2.4: 还原时间信息至原始形状
         # (B*S, nt, d) → (B, S, nt, d) → (B, nt, S, d) → (B, nt*S, d)
-        t_out = t_out.reshape(B, S, nt, d).permute(0, 2, 1, 3).reshape(B, nt * S, d)
+        t_out = t_out.reshape(B, S, nt, d).permute(
+            0, 2, 1, 3).reshape(B, nt * S, d)
         vid_out = self.temporal_out(t_out)
 
         # Step 3: 最终视频输出 = 空间分支残差 + 时间分支残差
@@ -732,7 +737,8 @@ class VideoSingleStreamSTBlock(nn.Module):
         txt_expanded = (
             txt_h.unsqueeze(1).expand(-1, nt, -1, -1).reshape(B * nt, n_txt, d)
         )
-        frame_seq = torch.cat([vid_per_frame, txt_expanded], dim=1)  # (B*nt, S+L, d)
+        frame_seq = torch.cat(
+            [vid_per_frame, txt_expanded], dim=1)  # (B*nt, S+L, d)
 
         qkv_ffn = self.qkv_ffn_in(frame_seq)
         qkv, ffn_in = qkv_ffn.split([3 * d, self.d_ff], dim=-1)
@@ -758,7 +764,8 @@ class VideoSingleStreamSTBlock(nn.Module):
         # ========== 时间注意力（只对视频）==========
         vid_after = x[:, :N_vid] + alpha[:, :, :d] * vid_s_out  # 先做空间残差
         vid_t = self.temporal_norm(vid_after)
-        vid_t = vid_t.reshape(B, nt, S, d).permute(0, 2, 1, 3).reshape(B * S, nt, d)
+        vid_t = vid_t.reshape(B, nt, S, d).permute(
+            0, 2, 1, 3).reshape(B * S, nt, d)
 
         tq, tk, tv = self.temporal_qkv(vid_t).chunk(3, dim=-1)
         tq = tq.reshape(B * S, nt, self.n_heads, self.d_k).transpose(1, 2)
@@ -767,7 +774,8 @@ class VideoSingleStreamSTBlock(nn.Module):
         t_out = self._attention(tq, tk, tv)
         t_out = t_out.transpose(1, 2).reshape(B * S, nt, d)
         t_out = self.temporal_out(t_out)
-        t_out = t_out.reshape(B, S, nt, d).permute(0, 2, 1, 3).reshape(B, nt * S, d)
+        t_out = t_out.reshape(B, S, nt, d).permute(
+            0, 2, 1, 3).reshape(B, nt * S, d)
 
         vid_final = vid_after + t_out
 
@@ -834,6 +842,58 @@ class VideoMMDiT(nn.Module):
     │                                                                        │
     └────────────────────────────────────────────────────────────────────────┘
     """
+    """
+    这是来自 FLUX/SD3 的设计思路，后续被 HunyuanVideo、Wan 等采纳：
+
+    双流层（前8层）— 先各自长本事
+
+    视频和文本是两种完全不同的模态：
+
+    视频：空间纹理、运动轨迹、色彩分布
+    文本：语义概念、语法结构
+    如果一开始就强行混在一起，两种模态会互相干扰，谁也学不好。双流层让视频和文本各有独立的 norm / FFN / modulation 参数，通过 STJointAttention 做信息交互，但各自保留自己的特征提取能力。
+
+    类比：两个人先各自做功课，再交流笔记，而不是一开始就一个人替另一个人写作业。
+
+    单流层（后8层）— 再深度融合
+
+    经过双流层后，视频和文本已经有了各自良好的表示，这时需要深层对齐——让视频特征精确对应文本语义（"橘猫"这个词要精确对应画面中猫的位置）。单流层把两者拼接成一个序列、共享参数，强制做更紧密的特征融合。
+
+    类比：两人各自研究完后，坐到同一张桌子前共同完成最后的方案。
+
+    为什么不全用双流？ 参数太多，双流两套参数代价大。后8层模态差异已经缩小，没必要再维护两套。
+
+    为什么不全用单流？ 前期视频和文本统计特性差异大，共享参数会导致一方被另一方"绑架"，学不好基础特征。
+    推理时双流和单流的分工更直观：
+
+双流层（前8层）— 理解"你要什么"和"现在有什么"
+
+输入是纯噪声 z_t + 文本"一只橘猫在草地上从左走到右"。此时：
+
+文本流：提取语义关键信息——"橘猫""草地""从左到右"
+视频流：在噪声中找与文本对应的结构线索
+两套参数各司其职，文本不用被迫去理解像素纹理，视频不用被迫去理解语法。通过 STJointAttention 交互，文本告诉视频"往猫的方向走"，视频告诉文本"我目前这个区域可能是猫的轮廓"。
+
+单流层（后8层）— 精准对齐语义和画面
+
+双流层已经让噪声大致成型（能看出猫的形状、草地的颜色），但细节可能不对——猫可能朝右但文本说"从左走到右"。单流层把视频和文本拼在一起共享参数，做精确对齐：
+
+"橘猫"这个词必须精确锚定到画面中猫的位置
+"从左到右"必须精确控制运动方向
+"草地"必须精确对应绿色区域
+推理时的直觉：
+
+
+t=1.0 纯噪声  → 双流层: 文本指引大方向，视频找大致结构
+                 单流层: 微调对齐
+
+t=0.5 半成型  → 双流层: 文本和视频各自深化理解
+                 单流层: 精确绑定词和区域
+
+t=0.0 接近完成 → 双流层: 稳定整体结构
+                 单流层: 最终语义-像素对齐
+一句话总结：双流是"各干各的+交流"，保证基础特征学得好；单流是"一起干"，保证最终语义和画面对得上。
+    """
 
     def __init__(self, cfg: VideoMMDiTConfig):
         super().__init__()
@@ -844,13 +904,16 @@ class VideoMMDiT(nn.Module):
         self.t_embed = TimestepEmbedding(cfg.d_model)
         self.text_proj = nn.Linear(cfg.text_d_model, cfg.d_model)
 
-        self.vid_pos_embed = nn.Parameter(torch.zeros(1, cfg.num_patches, cfg.d_model))
-        self.txt_pos_embed = nn.Parameter(torch.zeros(1, cfg.text_max_len, cfg.d_model))
+        self.vid_pos_embed = nn.Parameter(
+            torch.zeros(1, cfg.num_patches, cfg.d_model))
+        self.txt_pos_embed = nn.Parameter(
+            torch.zeros(1, cfg.text_max_len, cfg.d_model))
 
         # --- 双流层 ---
         self.double_blocks = nn.ModuleList(
             [
-                VideoMMDiTBlock(cfg.d_model, cfg.n_heads, cfg.d_ff, cfg.dropout)
+                VideoMMDiTBlock(cfg.d_model, cfg.n_heads,
+                                cfg.d_ff, cfg.dropout)
                 for _ in range(cfg.n_double_layers)
             ]
         )
