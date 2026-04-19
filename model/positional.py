@@ -1,162 +1,146 @@
+"""
+位置编码 — 让模型知道"每个 token 在第几个位置"
+================================================
+
+Transformer 的注意力本身没有顺序概念 (q·k 只看内容不看位置),
+所以必须额外注入位置信息。本文件实现了两种方式:
+
+  1. RoPE (旋转位置编码) — 在每层 attention 里旋转 Q 和 K, 编码相对位置
+  2. 正弦位置编码 — 在输入时加一次, 编码绝对位置
+
+默认配置: d_model=768, n_heads=12, d_k=64
+"""
+
 from __future__ import annotations
 
 import math
-from operator import inv
 
 import torch
 import torch.nn as nn
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# 1. 旋转位置编码 RoPE (Rotary Position Embedding)
-# ═══════════════════════════════════════════════════════════════════════════
 class RotaryPositionEmbedding(nn.Module):
     """
-    旋转位置编码 (RoPE) — Llama / Qwen / GPT-4 / Gemma 等主流模型的标配。
+    旋转位置编码 (RoPE) — Llama/Qwen/GPT-4 等主流模型的标准配置。
 
-    === RoPE vs 加法位置编码 (SinusoidalPositionalEncoding) ===
-
-    ┌────────────────────────────────────────────────────────────────────────┐
-    │                                                                        │
-    │  加法位置编码 (原始 Transformer):                                      │
-    │    x' = x + PE[pos]                                                    │
-    │    位置信息在输入时加一次，之后再也不注入                              │
-    │    深层 attention 中位置信息会被逐渐稀释                              │
-    │    编码的是绝对位置: "我在第 5 个位置"                                │
-    │                                                                        │
-    │  RoPE (旋转位置编码):                                                  │
-    │    不修改 x，而是在每一层 attention 计算前旋转 Q 和 K                  │
-    │    q' = rotate(q, θ_pos)                                              │
-    │    k' = rotate(k, θ_pos)                                              │
-    │    attn = q' · k'^T                                                   │
-    │    每一层都重新注入位置信息 → 不会稀释                                │
-    │    编码的是相对位置: q'_m · k'_n 只取决于 m-n (距离)                  │
-    │                                                                        │
-    └────────────────────────────────────────────────────────────────────────┘
-
-    === RoPE 的数学原理 ===
-
-    ┌────────────────────────────────────────────────────────────────────────┐
-    │                                                                        │
-    │  核心思想: 用二维旋转矩阵编码位置                                     │
-    │                                                                        │
-    │  把 d_k 维的向量每两个一组，视为复数平面上的点:                       │
-    │    (q_0, q_1) → q_0 + i·q_1 (一个复数)                               │
-    │    (q_2, q_3) → q_2 + i·q_3                                          │
-    │    ...                                                                 │
-    │                                                                        │
-    │  对第 m 个位置、第 j 对维度，乘以旋转因子:                            │
-    │    (q_0 + i·q_1) × e^{i·m·θ_j}                                       │
-    │                                                                        │
-    │  其中 θ_j = 1 / 10000^{2j/d_k}  (和正弦编码的频率相同)              │
-    │                                                                        │
-    │  展开 e^{i·m·θ} = cos(m·θ) + i·sin(m·θ):                            │
-    │    q'_0 = q_0 · cos(m·θ) - q_1 · sin(m·θ)                           │
-    │    q'_1 = q_0 · sin(m·θ) + q_1 · cos(m·θ)                           │
-    │                                                                        │
-    │  这就是一个 2D 旋转矩阵:                                             │
-    │    [q'_0]   [cos(mθ)  -sin(mθ)] [q_0]                               │
-    │    [q'_1] = [sin(mθ)   cos(mθ)] [q_1]                               │
-    │                                                                        │
-    │  关键性质:                                                             │
-    │    q'_m · k'_n = f(q, k, m-n)  ← 点积只取决于相对距离 m-n           │
-    │    证明: rotate(q,m) · rotate(k,n) = rotate(q·k, m-n)                │
-    │                                                                        │
-    │  直觉: 每对维度以不同频率旋转                                        │
-    │    - 低频维度: θ 小，旋转慢 → 编码远距离关系                         │
-    │    - 高频维度: θ 大，旋转快 → 编码近距离关系                         │
-    │    和正弦编码的多频率原理相同，但作用方式不同（旋转 vs 加法）         │
-    │                                                                        │
-    └────────────────────────────────────────────────────────────────────────┘
-
-    === 为什么 RoPE 比加法编码好？ ===
-
-    1. 相对位置: q·k 的值只取决于两个 token 的距离，不是绝对位置
-       → 更符合语言的本质（"猫吃鱼"中"吃"和"鱼"的关系不因出现位置而变）
-
-    2. 每层注入: 在每一层 attention 的 Q,K 上都做旋转
-       → 位置信息不会被深层计算稀释
-
-    3. 长度外推: 训练 4K 长度，推理时可以处理更长文本
-       → 配合 NTK-aware scaling 等技术效果更好
-
-    4. 无额外参数: 旋转角度是预计算的，不需要学习
-       → 不增加任何可训练参数
-
-    === 使用方式 ===
-
-    与加法编码不同，RoPE 不在 Decoder 的 forward 里用，
-    而是在每一层 MultiHeadAttention 的 Q, K 投影之后、点积之前用:
-
-      # 加法编码 (旧):
-      x = token_embed(ids)
-      x = x + PE[pos]          ← 只在这里加一次
-      for layer in layers:
-          x = layer(x, mask)    ← 后面不再注入位置
-
-      # RoPE (新):
-      x = token_embed(ids)      ← 不加位置编码
-      for layer in layers:
-          q, k = w_q(x), w_k(x)
-          q, k = rope(q, k)     ← 每层都旋转
-          attn = softmax(q @ k.T / √d) @ v
+    ┌──────────────────────────────────────────────────────────────────┐
+    │  核心思路: 用旋转角度编码位置                                    │
+    │                                                                  │
+    │  把 64 维的向量, 每两个维度看成 2D 平面上的一个点:              │
+    │    (q₀, q₁) = 一个 2D 点                                       │
+    │    (q₂, q₃) = 另一个 2D 点                                     │
+    │    ...共 32 对 (d_k/2=32)                                       │
+    │                                                                  │
+    │  对位置 m 的 token, 每对维度旋转一个角度:                       │
+    │    [q'₀]   [cos(m·θ)  -sin(m·θ)] [q₀]                         │
+    │    [q'₁] = [sin(m·θ)   cos(m·θ)] [q₁]                         │
+    │                                                                  │
+    │  不同对用不同频率 θ:                                            │
+    │    第0对: θ₀ = 1/10000^(0/64) = 1.0       旋转最快             │
+    │    第1对: θ₁ = 1/10000^(2/64) = 0.749                          │
+    │    第2对: θ₂ = 1/10000^(4/64) = 0.562                          │
+    │    ...                                                           │
+    │    第31对: θ₃₁ = 1/10000^(62/64) = 0.0001  旋转最慢           │
+    │                                                                  │
+    │  ┌────────────────────────────────────────────────────┐          │
+    │  │  为什么频率不同?                                    │          │
+    │  │                                                    │          │
+    │  │  高频 (θ大): 位置差1就转很多 → 区分相邻token      │          │
+    │  │  低频 (θ小): 位置差1几乎没转 → 能感受远距离关系   │          │
+    │  │  → 同时编码近距离和远距离的位置关系                │          │
+    │  └────────────────────────────────────────────────────┘          │
+    │                                                                  │
+    │  数值示例 — d_k=64, 3个 token, 只看第0对维度:                   │
+    │                                                                  │
+    │  θ₀ = 1.0                                                       │
+    │                                                                  │
+    │  位置0: 旋转 0×1.0 =   0 弧度 → 不旋转                        │
+    │  位置1: 旋转 1×1.0 =   1 弧度 → 转约 57°                      │
+    │  位置2: 旋转 2×1.0 =   2 弧度 → 转约 115°                     │
+    │                                                                  │
+    │  关键性质: q_m · k_n 只取决于 m-n (相对距离)                   │
+    │    位置2的q · 位置0的k = 旋转2步后和旋转0步的点积              │
+    │    位置2的q · 位置1的k = 旋转2步后和旋转1步的点积              │
+    │    差都是1步, 点积值相同 → 编码的是"距离1", 不是"位置2和位置1" │
+    │                                                                  │
+    │  对比正弦编码:                                                   │
+    │    正弦编码: "我在第 5 个位置" (绝对位置)                       │
+    │    RoPE:     "我离你 3 个位置" (相对位置)                       │
+    │    → 更符合语言本质 ("猫吃鱼"中关系不因出现位置而变)           │
+    └──────────────────────────────────────────────────────────────────┘
 
     参数:
-        d_k (int):     每个注意力头的维度 (d_model // n_heads)
-        max_len (int): 预计算的最大序列长度
-        base (float):  频率基数，默认 10000 (和正弦编码相同)
+        d_k: 每个注意力头的维度 (64)
+        max_len: 预计算的最大序列长度
+        base: 频率基数, 默认 10000
     """
 
     def __init__(self, d_k: int, max_len: int = 8192, base: float = 10000.0):
         super().__init__()
-        assert d_k % 2 == 0, "d_k must be even for RoPE (每两个维度一组做旋转)"
-        #d_k是每个注意力头的维度，类型是int，表示每个注意力头的维度。
-        #token是512的话 dk是64 8个头 512/8=64
+        assert d_k % 2 == 0, "d_k 必须是偶数 (每两个维度一组做旋转)"
         self.d_k = d_k
 
-        # 预计算频率: θ_j = 1 / base^{2j/d_k}, j = 0, 1, ..., d_k/2 - 1
-        # 形状: (d_k/2,)
-        #arange函数是用来生成一个从0到d_k-1的整数序列。
-        #inv_frep是频率的倒数。其实就是缓存了cos和sin的值。形状是(d_k/2,)。
-        #每个位置是dk/2个，因为每两个维度一组做旋转。
+        # 预计算频率: θ_j = 1 / base^(2j/d_k), j = 0,1,...,d_k/2-1
+        # 形状: (d_k/2,) = (32,)
+        # d_k=64: [1.0, 0.749, 0.562, ..., 0.0001]
         inv_freq = 1.0 / (base ** (torch.arange(0, d_k, 2).float() / d_k))
-        #register_buffer函数是用来注册一个缓冲区。
-        #缓冲区不会被视为模型的参数，不会在训练过程中更新，但会随着模型一起保存和加载。
-        #inv_freq是频率的倒数。其实就是缓存了cos和sin的值。形状是(d_k/2,)。
-        #每个位置是dk/2个，因为每两个维度一组做旋转。
         self.register_buffer("inv_freq", inv_freq)
 
-        # 预计算所有位置的 cos 和 sin
+        # 预计算所有位置的 cos 和 sin, 避免每次 forward 重复算
         self._build_cache(max_len)
 
     def _build_cache(self, max_len: int) -> None:
-        """预计算 cos(m·θ) 和 sin(m·θ) 的缓存表。"""
-        # positions: (max_len,) → (max_len, 1)
-        # positions是位置，类型是torch.Tensor，形状是(max_len, 1)。
-        # 从0到max_len-1的整数。
+        """
+        预计算 cos(m·θ) 和 sin(m·θ) 的缓存表。
+
+        ┌──────────────────────────────────────────────────────────────┐
+        │  数值示例 (d_k=64, max_len=5):                               │
+        │                                                              │
+        │  positions: [0, 1, 2, 3, 4]  形状 (5,1)                    │
+        │  inv_freq:  [1.0, 0.749, ...] 形状 (1, 32)                 │
+        │                                                              │
+        │  freqs = positions × inv_freq: (5, 32)                      │
+        │    每行是一个位置的 32 个频率值                              │
+        │    位置0: [0×1.0, 0×0.749, ...] = [0, 0, ...]             │
+        │    位置1: [1×1.0, 1×0.749, ...] = [1, 0.749, ...]         │
+        │    位置2: [2×1.0, 2×0.749, ...] = [2, 1.498, ...]         │
+        │                                                              │
+        │  cat([freqs, freqs]): (5, 64)                               │
+        │    为什么重复? 因为每对维度需要同样的 cos/sin              │
+        │    (q₀,q₁) 用 cos[0] 和 sin[0],                            │
+        │    (q₂,q₃) 也用 cos[0] 和 sin[0] — 和前半一样             │
+        │    这样 x * cos + rotate_half(x) * sin 就是 2D 旋转        │
+        │                                                              │
+        │  cos_cached: (5, 64) — 每个位置每个维度的 cos 值           │
+        │  sin_cached: (5, 64) — 每个位置每个维度的 sin 值           │
+        └──────────────────────────────────────────────────────────────┘
+        """
         positions = torch.arange(max_len, dtype=torch.float32).unsqueeze(1)
-        # inv_freq: (d_k/2,) → (1, d_k/2)
-        # freqs = positions × inv_freq: (max_len, d_k/2)
         freqs = positions * self.inv_freq.unsqueeze(0)
-        # 每对维度需要同样的 cos/sin，所以 repeat → (max_len, d_k)
         freqs = torch.cat([freqs, freqs], dim=-1)
-        # 缓存 cos 和 sin
-        # (max_len, d_k)：表示“序列长度为 max_len，每个 token 有 d_k 维（每对维度一组做旋转）”。
-        # max_len 是“最大支持的序列长度”。在这里，它用于预先计算从位置 0 到位置 max_len-1 所有的 cos/sin 旋转频率表，以便后续不同 batch、不同 token 位置都能直接索引这些频率，无需每次动态计算。
-        # 也就是说：对于每个序列位置（从 0 到 max_len-1），都有 d_k 个 cos/sin 配对频率。这样同一组 cos/sin 可作用于所有 batch/head。
         self.register_buffer("cos_cached", freqs.cos(), persistent=False)
         self.register_buffer("sin_cached", freqs.sin(), persistent=False)
 
     def _rotate_half(self, x: torch.Tensor) -> torch.Tensor:
         """
-        把向量的前半和后半交换并取负，用于实现旋转。
+        把向量的前半和后半交换并取负, 配合 cos/sin 实现 2D 旋转。
 
-        x = [x_0, x_1, x_2, x_3, ..., x_{d/2-1}, x_{d/2}, ..., x_{d-1}]
-        返回 [-x_{d/2}, ..., -x_{d-1}, x_0, ..., x_{d/2-1}]
-
-        这样 x * cos + rotate_half(x) * sin 就等价于对每对维度做 2D 旋转:
-          x'_0 = x_0 · cos - x_1 · sin
-          x'_1 = x_0 · sin + x_1 · cos
+        ┌──────────────────────────────────────────────────────────────┐
+        │  数值示例 (d_k=8):                                           │
+        │                                                              │
+        │  x = [a, b, c, d, e, f, g, h]                               │
+        │  前半: [a, b, c, d]    后半: [e, f, g, h]                   │
+        │  返回: [-e, -f, -g, -h, a, b, c, d]                         │
+        │                                                              │
+        │  这样 x * cos + rotate_half(x) * sin 就等于:               │
+        │    a*cos₀ + (-e)*sin₀ = a*cos(θ) - e*sin(θ) ← q'₀        │
+        │    b*cos₀ + (-f)*sin₀ = b*cos(θ) - f*sin(θ) ← q'₁        │
+        │    ...                                                      │
+        │    e*cos₀ + a*sin₀     = e*cos(θ) + a*sin(θ) ← q'₄       │
+        │                                                              │
+        │  等价于每对 (q₀,q₁) 做 2D 旋转, 只是用了前后半的方式      │
+        │  比逐对循环更高效 (向量化)                                   │
+        └──────────────────────────────────────────────────────────────┘
         """
         half = x.shape[-1] // 2
         x1 = x[..., :half]
@@ -165,166 +149,127 @@ class RotaryPositionEmbedding(nn.Module):
 
     def forward(
         self,
-        q: torch.Tensor,  # (batch, n_heads, seq_len_q, d_k)
-        k: torch.Tensor,  # (batch, n_heads, seq_len_k, d_k)
-        offset: int = 0,  # KV缓存或增量解码时的起始位置偏移
+        q: torch.Tensor,
+        k: torch.Tensor,
+        offset: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        对 Q 和 K 应用旋转位置编码。
+        对 Q 和 K 应用旋转, V 不动。
 
-        q: (batch, n_heads, seq_len, d_k)
-        k: (batch, n_heads, seq_len, d_k)  — seq_len 可以和 q 不同 (KV cache)
-        offset: 位置偏移量，用于推理时的增量解码
-                第一次 offset=0，之后每次 +1
-
-        返回: (q_rotated, k_rotated) 形状不变
-
-        使用示例:
-            rope = RotaryPositionEmbedding(d_k=64)
-
-            # 训练时:
-            q_rot, k_rot = rope(q, k)
-
-            # 推理时 (增量解码, 每次 1 个 token):
-            q_rot, k_rot = rope(q, k, offset=current_pos)
+        ┌──────────────────────────────────────────────────────────────┐
+        │  数值示例: B=2, n_heads=12, seq=5, d_k=64                   │
+        │                                                              │
+        │  q: (2, 12, 5, 64) — 5 个 token, 每个 64 维                │
+        │  k: (2, 12, 5, 64)                                          │
+        │                                                              │
+        │  取 cos/sin:                                                 │
+        │    cos_cached[0:5]: (5, 64) — 5 个位置的 cos 值             │
+        │    unsqueeze 两次: (1, 1, 5, 64) — 广播到所有 batch/head   │
+        │                                                              │
+        │  旋转:                                                       │
+        │    q_rotated = q * cos_q + rotate_half(q) * sin_q           │
+        │    → 逐元素乘, 形状不变: (2, 12, 5, 64)                     │
+        │                                                              │
+        │  为什么 V 不旋转?                                            │
+        │    注意力公式: attn = softmax(q'·k'^T / √d) × v            │
+        │    位置信息已经通过 q'·k'^T 的点积注入了                    │
+        │    v 只是携带内容信息, 不需要位置                            │
+        │                                                              │
+        │  offset 参数: 推理时增量解码用                               │
+        │    训练时 offset=0, 从位置0开始                              │
+        │    推理时 offset=已生成token数, 让新token从正确位置旋转     │
+        └──────────────────────────────────────────────────────────────┘
         """
-        # 这里的 size(2) 表示沿着第三个维度（下标2）取序列长度，对应 (batch, n_heads, seq_len, d_k) 里的 seq_len
-        # 取出来是一个整数，表示序列长度。
-
-        # seq_len_q 是一个整数，表示这次计算时 query 有多少个 token（序列长度）。
-        # 它不是“有几个头”，也不是“每个头有多少维”。
-        # 每个头的维度是 d_k，不同头的 token 数都是 seq_len_q。
-        """有多少个token要旋转"""
         seq_len_q = q.size(2)
         seq_len_k = k.size(2)
 
-        # 取对应位置的 cos/sin
-       
-        # unsqueeze函数是用来在指定的维度上增加一个维度。
-        # cos_q和sin_q的形状是(1, 1, seq_len_q, d_k)。
-        #cos 和sin都是与计算好了的 不是训练的
-
-        """
-        取出来cos和sin，cos和sin是与计算好了的 不是训练的
-        self.cos_cached[offset : offset + seq_len_q]取出来是一个形状为(seq_len_q, d_k)的tensor，
-        (seq_len_q, d_k)现在代表q是多少个token要旋转，dk代表每个token的维度。
-        ？那这里的dk是多少？dk是每个头的维度，是d_model/n_heads。
-
-        # 还是有点疑惑这里的 d_k 的理解：
-        # 假设 embedding 维度是512，n_heads=8，那么每个 head 的 d_k=64。
-        # 这里的 cos_q, sin_q shape 是 (1, 1, seq_len_q, d_k)，它会作用到每个 head 的 64 个维度上。
-        # 注意，每个 head 虽然都是 64 维，但这 8 个 head 的 旋转 不是“重复”应用一组 cos/sin，
-        
-        # 你的理解是对的！实际上，不论是 head_i 还是 head_{i+1}，
-        # 对于同样的序列位置和同样的那一组（比如第一组）维度，它们用的旋转角度（cos/sin 参数）完全一样。
-        # 例如：head 0 的[第0-1维]在第M个token上假如旋转30度，那么 head 1 在同样的[第0-1维]、同样的token上也是旋转30度（只是举例说明角度）。
-        # 所以 RoPE 的参数不会因为 head 不同而有差异，每个 head 和其它 head 在位置/分组上的旋转方式完全一致，参数是共享并广播的。
-        
-        #
-        # 很好，这个细节很关键！你的理解其实已经很接近本质，我们再澄清下按分 head/分组后的行为：
-        #
-        # 关键点——即使拆 head，每个 token 下的“第0维”和“第64维”（或者任意两对2i, 2i+1维）使用的旋转角度（θ）也是不同的！
-        # 拆 head 仅仅是在张量切片/并行意义上，并不会让“同一个 token 的不同 head 的首维”都用相同旋转——它们各自对应原始 embedding 的不同切片。
-        #
-        # 举例（假设 embedding 512，n_heads=8, d_k=64）：
-        #   - head0 的第0-1维（实际上是总向量的0-1）用 θ_0
-        #   - head1 的第0-1维（总向量的64-65）用 θ_32
-        #     ...依此类推
-        #   - 每两维一组，组编号不同，θ_j 就不同
-        #
-        # 所以对于同一个 token，不同 head 的第0-1号（以 head 内视角）实际上在全量向量上对应的位置也不同，因此 θ 也不同。
-        # 实际代码中的 cos_cached/sin_cached shape 是 (max_seq_len, d_k)，
-        # 但你可以把“d_k”理解为“全 embedding 维度中每两维为一组、总共多少组”，head 只是张量 view 的一个维度，不会更改组内编号对应的θ。
-        #
-        # 具体算的时候：q 的 shape (batch, n_heads, seq_len, d_k)
-        #   - 对于每个 token（seq_len 维），把 d_k 维看为 [pair0, pair1, ..., pair_(d_k//2-1)]，每对有自己的θ
-        #   - 通过广播，cos_q/sin_q 扩展到所有 heads/批次
-        #
-        # 总结：
-        # - 不同 head、不同组，不会“同θ”
-        # - 拆分 head 不会让维度上的旋转角度失去丰富性
-        # - 所有位置、所有维度的 θ 都还是唯一确定的（按原始 embedding 逻辑），只是物理上分片以便并行
-        #
-        # 这样设计的原因是：让所有 head 在自己的子空间都获得最大的信息分布和位置分辨能力，既分片又不损失原始的相对位置信息密度。
-        """
-        # cos_q的形状是(1, 1, seq_len_q, d_k)。代表每个token的每个维度都要旋转。
-        #offset : offset + seq_len_q 表示从offset开始到offset + seq_len_q结束。
         cos_q = self.cos_cached[offset : offset + seq_len_q].unsqueeze(0).unsqueeze(0)
         sin_q = self.sin_cached[offset : offset + seq_len_q].unsqueeze(0).unsqueeze(0)
 
         cos_k = self.cos_cached[offset : offset + seq_len_k].unsqueeze(0).unsqueeze(0)
         sin_k = self.sin_cached[offset : offset + seq_len_k].unsqueeze(0).unsqueeze(0)
 
-        # 旋转: x' = x * cos + rotate_half(x) * sin
-        # 这里的 self._rotate_half(q) 实际上实现了“复数乘法的虚部交换”——
-        # 把 q 的后一半和前一半交叉交换符号，等价于 (q_0, q_1) 视为复数时分别取实部和虚部；
-        # q 的 shape 是 (..., d_k) 假设 d_k 偶数。
-        # 这样做的目的是：q * cos 是原始向量的实部，rotate_half(q) * sin 是旋转后产生的虚部。
-        # 代码里没有直接写一个“half q”，而是把 q 分前半和后半——原因来自于 RoPE 公式的数学本质（见类头注）。
-        """
-        rotate_half函数是用来将一个向量的前半部分和后半部分交换并取负。举例说明：
-        假设向量是[1, 2, 3, 4, 5, 6, 7, 8]，那么rotate_half函数会返回[-4, -5, -6, -7, 1, 2, 3, 4]。
-        这样做的目的是：q * cos 是原始向量的实部，rotate_half(q) * sin 是旋转后产生的虚部。
-        """
         q_rotated = q * cos_q + self._rotate_half(q) * sin_q
         k_rotated = k * cos_k + self._rotate_half(k) * sin_k
 
         return q_rotated, k_rotated
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# 2. 原始正弦加法位置编码 (保留兼容)
-# ═══════════════════════════════════════════════════════════════════════════
 class SinusoidalPositionalEncoding(nn.Module):
     """
-    正弦位置编码，不使用学习的方式，而是使用正弦函数和余弦函数。
-    PE(pos, 2i)   = sin(pos / 10000^(2i/d_model))
-    PE(pos, 2i+1) = cos(pos / 10000^(2i/d_model))
+    正弦位置编码 (原始 Transformer 方式) — 在输入时加一次。
+
+    ┌──────────────────────────────────────────────────────────────────┐
+    │  公式:                                                          │
+    │    PE(pos, 2i)   = sin(pos / 10000^(2i/d_model))               │
+    │    PE(pos, 2i+1) = cos(pos / 10000^(2i/d_model))               │
+    │                                                                  │
+    │  数值示例 (d_model=8, 3个位置):                                 │
+    │                                                                  │
+    │  位置0: [sin(0), cos(0), sin(0), cos(0), sin(0), cos(0), ...]  │
+    │       = [0, 1, 0, 1, 0, 1, ...]                                │
+    │                                                                  │
+    │  位置1: [sin(1/1), cos(1/1), sin(1/21.5), cos(1/21.5), ...]   │
+    │       = [0.84, 0.54, 0.05, 1.0, ...]                           │
+    │                                                                  │
+    │  位置2: [sin(2/1), cos(2/1), sin(2/21.5), cos(2/21.5), ...]   │
+    │       = [0.91, -0.42, 0.09, 1.0, ...]                          │
+    │                                                                  │
+    │  使用方式: x' = x + PE[pos] — 直接加到 token embedding 上      │
+    │                                                                  │
+    │  ┌──────────────────────────────────────────────────┐            │
+    │  │  RoPE vs 正弦编码 的根本区别:                     │            │
+    │  │                                                    │            │
+    │  │  正弦编码:  x' = x + PE[pos]                      │            │
+    │  │    在输入时加一次, 深层会逐渐稀释                 │            │
+    │  │    编码绝对位置: "我在第5个位置"                   │            │
+    │  │                                                    │            │
+    │  │  RoPE:     q' = rotate(q, θ_pos)                  │            │
+    │  │    每层都旋转 Q,K, 位置信息永不稀释              │            │
+    │  │    编码相对位置: "我离你3个位置"                   │            │
+    │  │                                                    │            │
+    │  │  两者频率公式一样, 只是注入方式不同:              │            │
+    │  │    正弦: 加法 → 改变向量值                        │            │
+    │  │    RoPE: 旋转 → 改变向量方向, 不改变大小         │            │
+    │  └──────────────────────────────────────────────────┘            │
+    └──────────────────────────────────────────────────────────────────┘
+
     参数:
-        d_model是输入的维度，类型是int，表示输入的维度。
-        max_len是最大长度，类型是int，表示最大长度。最大长度是5000。指的是输出token的最大长度。
-        dropout是dropout的比例，类型是float，表示dropout的比例。
-    返回值:
-        torch.Tensor: 位置编码，形状为 (max_len, d_model)
+        d_model: 模型维度 (768)
+        max_len: 预计算的最大序列长度
+        dropout: dropout 比例
     """
 
     def __init__(self, d_model: int, max_len: int = 5000, dropout: float = 0.1):
         super().__init__()
-        """
-        初始化SinusoidalPositionalEncoding类的实例。
-        1. 初始化父类nn.Module。
-        2. 创建一个Dropout层，使用传入的dropout参数。
-        3. 创建一个零张量pe，形状为(max_len, d_model)，用于存储位置编码。
-        4. 创建一个位置张量position，形状为(max_len, 1)，包含从0到max_len-1的整数。
-        5. 创建一个除数张量div_term，形状为(d_model/2)，用于计算位置编码中的除数部分。
-        6. 使用正弦函数和余弦函数计算位置编码的正弦和余弦部分，并将结果存储在pe中。
-        7. 在pe的第一维添加一个维度，使其形状变为(1, max_len, d_model)，以便后续与输入的token表示进行广播操作。
-        8. 将pe注册为模型的一个缓冲区，这意味着它不会被视为模型的参数，不会在训练过程中更新，但会随着模型一起保存和加载。
-        """
         self.dropout = nn.Dropout(dropout)
-        # pe是位置编码，类型是torch.Tensor，形状是(max_len, d_model)。
+
         pe = torch.zeros(max_len, d_model)
-        # position是位置，类型是torch.Tensor，形状是(max_len, 1)。
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        # div_term是除数，类型是torch.Tensor，形状是(d_model/2)。
-        # exp函数是指数函数，torch.exp(x)返回e的x次幂。这里计算了位置编码中的除数部分，使用了指数函数来计算。
+        # div_term: (d_model/2,) — 和 RoPE 的 inv_freq 是同一个公式
+        # 只是这里算的是 e^{-2i·ln(10000)/d_model} = 1/10000^{2i/d_model}
         div_term = torch.exp(
             torch.arange(0, d_model, 2, dtype=torch.float)
             * (-math.log(10000.0) / d_model)
         )
-        # 计算位置编码的正弦和余弦部分。对于偶数位置使用正弦函数，对于奇数位置使用余弦函数。
+        # 偶数维用 sin, 奇数维用 cos — 一对(sin,cos)编码同一个频率
         pe[:, 0::2] = torch.sin(position * div_term)
-        # 计算位置编码的正弦和余弦部分。对于偶数位置使用正弦函数，对于奇数位置使用余弦函数。
         pe[:, 1::2] = torch.cos(position * div_term)
-        # unsqueeze(0)在位置编码的第一维添加一个维度，使得pe的形状变为(1, max_len, d_model)。这样做是为了在后续的计算中能够与输入的token表示进行广播操作。
-        pe = pe.unsqueeze(0)  # (1, max_len, d_model)
-        # register_buffer方法将pe注册为模型的一个缓冲区，这意味着它不会被视为模型的参数，不会在训练过程中更新，但会随着模型一起保存和加载。
+        # (1, max_len, d_model) — 加 batch 维, 方便后面广播
+        pe = pe.unsqueeze(0)
         self.register_buffer("pe", pe)
 
-    # x是输入，类型是torch.Tensor，形状是(batch, seq_len, d_model)。
-    # 输出是(batch, seq_len, d_model)。
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (batch, seq_len, d_model)"""
-        # x是输入序列的token表示，形状是(batch, seq_len, d_model)。
+        """
+        ┌──────────────────────────────────────────────────────────────┐
+        │  x: (B, seq_len, d_model) = (2, 5, 768)                    │
+        │  pe[:, :5]: (1, 5, 768) — 取前5个位置的编码                │
+        │  x + pe: (2, 5, 768) — 广播相加, 每个 token 加上位置信息   │
+        │                                                              │
+        │  为什么加法能编码位置?                                       │
+        │    两个不同位置的 token, 即使内容相同, 加了不同的 PE 后     │
+        │    在 768 维空间里就不同了, 注意力计算时能区分              │
+        └──────────────────────────────────────────────────────────────┘
+        """
         x = x + self.pe[:, : x.size(1)]
         return self.dropout(x)

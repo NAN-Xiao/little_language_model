@@ -5,6 +5,24 @@ from dataclasses import dataclass, field
 
 @dataclass
 class ModelConfig:
+    """模型超参数配置。
+
+    Attributes:
+        vocab_size: 词表大小
+        d_model: 模型隐藏维度
+        n_heads: 注意力头数
+        n_decoder_layers: 解码器层数
+        d_ff: FFN 中间层维度 (通常 d_model×4)
+        dropout: dropout 比例
+        max_seq_len: 最大序列长度
+        pad_token_id: 填充 token 的 id
+        bos_token_id: 句首 token 的 id
+        eos_token_id: 句尾 token 的 id
+        use_rope: True=RoPE旋转位置编码(Llama/Qwen风格), False=加法正弦位置编码(原始Transformer风格)
+        use_moe: True=FFN替换为稀疏MoE专家, False=普通FFN
+        moe_num_experts: MoE专家数量
+        moe_lb_coeff: MoE负载均衡损失系数, 训练总损失 += 此值 × LB_loss, 调大让专家更均匀分工, 调小让路由更自由
+    """
     vocab_size: int = 68
     d_model: int = 768
     n_heads: int = 12
@@ -15,18 +33,15 @@ class ModelConfig:
     pad_token_id: int = 0
     bos_token_id: int = 1
     eos_token_id: int = 2
-    # 位置编码：为 True 时使用旋转位置编码 RoPE (Llama/Qwen 风格)，
-    # 为 False 时使用加法正弦位置编码 (原始 Transformer 风格)
     use_rope: bool = False
-    # MoE：为 True 时每个 Decoder Block 的 FFN 换为稀疏专家（见 model/moe_feedforward.py）
     use_moe: bool = False
     moe_num_experts: int = 4
-    # 训练时总损失 += moe_lb_coeff * collect_moe_load_balance_loss(model)
     moe_lb_coeff: float = 0.01
 
 
 @dataclass
 class TrainConfig:
+    
     data_path: str | None = "data/pretrain/wikipedia-zh-cn-20240820.json"  # 数据文件路径，str 或 None
     batch_size: int = 4                   # 每个批次的样本数量
     num_epochs: int = 3                   # 训练总轮数
@@ -40,7 +55,8 @@ class TrainConfig:
     log_interval: int = 50                # 日志记录的间隔步数
     save_interval: int = 1                # 检查点保存的间隔（以 epoch 为单位）
     seed: int = 42                        # 随机种子
-    seq_len: int = 256                    # 输入序列最大长度 (128k，一般大模型设置) deepseek-r1 设置为 128k
+    # 输入序列最大长度 (128k，一般大模型设置) deepseek-r1 设置为 128k
+    seq_len: int = 256
     grad_accum_steps: int = 8             # 梯度累积步数，用于在较小显存上模拟更大 batch
     mixed_precision: str = "auto"         # auto / fp16 / bf16 / off
     safe_mode: bool = True                # 启用更稳的 CUDA 训练策略
