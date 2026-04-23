@@ -10,12 +10,17 @@
 from __future__ import annotations
 
 import math
+from typing import TypeAlias
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from .positional import RotaryPositionEmbedding
+
+# KV-Cache 类型: 每层缓存一对 (K, V) 张量, 初始为 None
+# K/V 形状: (B, n_heads, seq_len_so_far, d_k)
+KVCache: TypeAlias = list[tuple[torch.Tensor, torch.Tensor] | None]
 
 
 class MultiHeadAttention(nn.Module):
@@ -191,7 +196,8 @@ class MultiHeadAttention(nn.Module):
         value: torch.Tensor,
         mask: torch.Tensor | None = None,
         rope_offset: int = 0,
-    ) -> torch.Tensor:
+        kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         """
         多头注意力完整前向传播。
 
@@ -258,8 +264,15 @@ class MultiHeadAttention(nn.Module):
         v = v.transpose(1, 2)
 
         # ═══ 可选: RoPE 旋转位置编码 (拆多头之后才旋转) ═══
+        # 注意: 必须在拼接缓存之前旋转! 缓存里的 K 已经旋转过了
         if self.use_rope:
             q, k = self.rope(q, k, offset=rope_offset)
+
+        # ═══ KV-Cache: 拼接缓存的 K,V 和新 token 的 K,V ═══
+        if kv_cache is not None:
+            k_prev, v_prev = kv_cache
+            k = torch.cat([k_prev, k], dim=2)  # 沿 seq_len 维拼接
+            v = torch.cat([v_prev, v], dim=2)
 
         # ═══ 缩放点积注意力 ═══
         if mask is not None and mask.dim() == 3:
@@ -275,4 +288,4 @@ class MultiHeadAttention(nn.Module):
         attn_output = attn_output.contiguous()      # 保证内存连续 (transpose后不连续)
         attn_output = attn_output.view(
             batch_size, -1, self.d_model)  # 12×64=768, 拼回
-        return self.w_o(attn_output)
+        return self.w_o(attn_output), (k, v)

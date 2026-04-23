@@ -259,17 +259,21 @@ class SinusoidalPositionalEncoding(nn.Module):
         pe = pe.unsqueeze(0)
         self.register_buffer("pe", pe)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, offset: int = 0) -> torch.Tensor:
         """
         ┌──────────────────────────────────────────────────────────────┐
         │  x: (B, seq_len, d_model) = (2, 5, 768)                    │
-        │  pe[:, :5]: (1, 5, 768) — 取前5个位置的编码                │
+        │  pe[:, offset:offset+5]: (1, 5, 768) — 取对应位置的编码    │
         │  x + pe: (2, 5, 768) — 广播相加, 每个 token 加上位置信息   │
+        │                                                              │
+        │  offset 参数: KV-Cache 增量解码用                            │
+        │    训练/首次: offset=0, 从位置0开始 (行为不变)             │
+        │    增量解码: offset=已生成token数, 新token从正确位置开始    │
         │                                                              │
         │  为什么加法能编码位置?                                       │
         │    两个不同位置的 token, 即使内容相同, 加了不同的 PE 后     │
         │    在 768 维空间里就不同了, 注意力计算时能区分              │
         └──────────────────────────────────────────────────────────────┘
         """
-        x = x + self.pe[:, : x.size(1)]
+        x = x + self.pe[:, offset : offset + x.size(1)]
         return self.dropout(x)

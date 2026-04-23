@@ -14,6 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from config import ModelConfig
+from .attention import KVCache
 from .decoder import Decoder
 
 
@@ -134,13 +135,24 @@ class Transformer(nn.Module):
         ).unsqueeze(0)
         return pad_mask & causal_mask
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        kv_cache: KVCache | None = None,
+        rope_offset: int = 0,
+    ) -> torch.Tensor | tuple[torch.Tensor, KVCache]:
         """
         (B, seq) → (B, seq, vocab_size)
+        当 kv_cache 不为 None 时, 返回 (logits, new_kv_cache)
         """
         tgt_mask = self.make_causal_mask(input_ids)
-        hidden = self.decoder(input_ids, tgt_mask=tgt_mask)
+        hidden, new_kv_cache = self.decoder(
+            input_ids, tgt_mask=tgt_mask,
+            rope_offset=rope_offset, kv_cache=kv_cache,
+        )
         logits = self.output_proj(hidden)
+        if kv_cache is not None:
+            return logits, new_kv_cache
         return logits
 
     @torch.no_grad()
@@ -158,34 +170,22 @@ class Transformer(nn.Module):
     ) -> torch.Tensor:
         """
         自回归文本生成 — 逐步预测下一个 token, 拼接到序列末尾, 直到 eos 或 max_len。
+        使用 KV-Cache: 第1步处理完整 prompt, 之后每步只处理 1 个新 token。
 
         ┌──────────────────────────────────────────────────────────────┐
-        │  采样策略示例 (词表=68, 只看最后一步的 logits):             │
+        │  KV-Cache 生成流程:                                          │
         │                                                              │
-        │  假设 logits = [2.1, -0.5, 0.8, 3.5, -1.0, ...]            │
+        │  第1步: 输入完整 prompt [3,12,45,7] → forward → logits     │
+        │         同时缓存每层的 K,V → kv_cache 建立起来             │
         │                                                              │
-        │  ① temperature: 控制随机性                                  │
-        │    logits /= temperature                                     │
-        │    temperature=0.1: 几乎只选最大概率 → 确定性强, 保守       │
-        │    temperature=1.0: 原始分布 → 正常                         │
-        │    temperature=2.0: 概率更均匀 → 更随机, 更有创意           │
+        │  第2步: 只输入新 token [45] → forward(kv_cache) → logits   │
+        │         Q 只有1个token, K/V = 缓存+新 = [旧4个+新1个]     │
+        │         注意力: 1×5 而非 5×5, 省了 80% 计算                │
         │                                                              │
-        │  ② top_k: 只保留概率最高的 k 个                             │
-        │    top_k=5: 把68个token里最低的63个设为-inf                 │
-        │    → 从 top 5 里采样, 避免选到极低概率的 token             │
+        │  第3步: 只输入 [7] → K/V = [旧5个+新1个] = 6个             │
+        │         注意力: 1×6, 仍然只需算1行                          │
         │                                                              │
-        │  ③ top_p (nucleus): 保留累积概率达到 p 的最少 token        │
-        │    top_p=0.9: 从最高概率开始累加, 到 90% 就停止             │
-        │    → 自适应: 如果 1 个 token 占 90%, 就只选它              │
-        │    → 如果 50 个 token 才占 90%, 就从 50 个里选             │
-        │                                                              │
-        │  ④ repetition_penalty: 惩罚已生成的 token                   │
-        │    如果 token 已出现过: 正logit 除以 penalty, 负logit 乘以  │
-        │    → 降低重复出现的概率                                    │
-        │                                                              │
-        │  ⑤ no_repeat_ngram_size: 禁止重复 n-gram                   │
-        │    size=3: 如果 "今天天气" 已出现过,                        │
-        │    下一次生成 "今天天" 后就不能再生成 "气"                  │
+        │  → 复杂度从 O(N²) 降到 O(N), 长序列生成大幅加速           │
         └──────────────────────────────────────────────────────────────┘
         """
         eos_token_id = eos_token_id or self.cfg.eos_token_id
@@ -194,9 +194,37 @@ class Transformer(nn.Module):
         generated = input_ids.clone()
         batch_size = generated.size(0)
         finished = torch.zeros(batch_size, dtype=torch.bool, device=generated.device)
+        kv_cache: KVCache | None = None
+        first_step = True
 
         for step_idx in range(max_len):
-            logits = self(generated)[:, -1, :] / max(temperature, 1e-5)
+            # 序列长度保护: 超过 max_seq_len 就停止
+            if generated.size(1) >= self.cfg.max_seq_len:
+                break
+
+            if first_step:
+                # 第1步: 处理完整 prompt, 建立缓存
+                # 传空列表而非None, 让forward返回(logits, kv_cache)元组
+                step_input = generated
+                tgt_mask = self.make_causal_mask(step_input)
+                rope_offset = 0
+                kv_cache_arg: KVCache | None = []
+                first_step = False
+            else:
+                # 后续步: 只输入新 token, 使用缓存
+                step_input = generated[:, -1:]
+                # 新 token 可以看所有已生成的 token (因果性已由缓存保证)
+                seq_k = generated.size(1)
+                tgt_mask = torch.ones(
+                    batch_size, 1, seq_k,
+                    dtype=torch.bool, device=generated.device,
+                )
+                rope_offset = generated.size(1) - 1
+                kv_cache_arg = kv_cache
+
+            # 带缓存的 forward
+            logits, kv_cache = self(step_input, kv_cache=kv_cache_arg, rope_offset=rope_offset)
+            logits = logits[:, -1, :] / max(temperature, 1e-5)
 
             if step_idx < min_new_tokens:
                 logits[:, eos_token_id] = float("-inf")

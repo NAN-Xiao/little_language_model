@@ -23,7 +23,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from .attention import MultiHeadAttention
+from .attention import KVCache, MultiHeadAttention
 from .feedforward import PositionwiseFeedForward
 from .moe_feedforward import MoEFeedForward
 from .positional import SinusoidalPositionalEncoding
@@ -185,16 +185,21 @@ class DecoderBlock(nn.Module):
         self,
         x: torch.Tensor,
         tgt_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """(B, seq, d_model) → (B, seq, d_model)"""
+        rope_offset: int = 0,
+        kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """(B, seq, d_model) → (B, seq, d_model), (k_cache, v_cache)"""
         # Pre-Norm + 残差: x + Attn(norm(x))
         normed = self.norm1(x)
-        
-        x = x + self.dropout1(self.masked_self_attn(normed, normed, normed, tgt_mask))
+        attn_out, new_kv_cache = self.masked_self_attn(
+            normed, normed, normed, tgt_mask,
+            rope_offset=rope_offset, kv_cache=kv_cache,
+        )
+        x = x + self.dropout1(attn_out)
         # Pre-Norm + 残差: x + FFN(norm(x))
         normed = self.norm2(x)
         x = x + self.dropout2(self.ffn(normed))
-        return x
+        return x, new_kv_cache
 
 
 class Decoder(nn.Module):
@@ -317,8 +322,10 @@ class Decoder(nn.Module):
         self,
         tgt: torch.Tensor,
         tgt_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """token_ids: (B, seq) → hidden: (B, seq, d_model)"""
+        rope_offset: int = 0,
+        kv_cache: KVCache | None = None,
+    ) -> tuple[torch.Tensor, KVCache]:
+        """token_ids: (B, seq) → hidden: (B, seq, d_model), kv_cache"""
         # Embedding + 缩放
         x = self.token_embedding(tgt) * (self.d_model**0.5)
 
@@ -326,11 +333,16 @@ class Decoder(nn.Module):
         if self.use_rope:
             x = self.embed_dropout(x)
         else:
-            x = self.pos_encoding(x)
+            # KV-Cache 增量解码时, 用 offset 让新 token 加上正确位置的编码
+            offset = rope_offset if kv_cache is not None else 0
+            x = self.pos_encoding(x, offset=offset)
 
-        # 10层 DecoderBlock
-        for layer in self.layers:
-            x = layer(x, tgt_mask)
+        # 10层 DecoderBlock, 逐层透传 kv_cache
+        new_kv_cache: KVCache = []
+        for i, layer in enumerate(self.layers):
+            layer_cache = kv_cache[i] if kv_cache is not None and i < len(kv_cache) else None
+            x, layer_new_cache = layer(x, tgt_mask, rope_offset=rope_offset, kv_cache=layer_cache)
+            new_kv_cache.append(layer_new_cache)
 
         # 最终归一化
-        return self.norm(x)
+        return self.norm(x), new_kv_cache
