@@ -54,3 +54,6 @@ BELLE — 中文指令微调数据
 alpaca-chinese — 中文 Alpaca 格式
 Firefly — 中文多任务对话
 建议路径：先用项目自带的 Tiny Shakespeare 跑通训练流程，确认没报错，然后换维基百科中文（你项目已有 Wikipedia JSONL 的流式加载支持），最后再上大规模语料。
+
+
+curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/json" -d "{\"model\":\"gemma4-26b\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"详细描述这个视频内容\"},{\"type\":\"video_url\",\"video_url\":{\"url\":\"file:///C:/Users/elex/Desktop/0d7c6987bf4bdae5_01.mp4\"}}]}],\"max_tokens\":2048}"
