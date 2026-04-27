@@ -281,18 +281,20 @@ class ResBlock3D(nn.Module):
     def __init__(self, channels: int, dropout: float = 0.0):
         super().__init__()
         self.block = nn.Sequential(
-            nn.GroupNorm(32, channels),
-            nn.SiLU(),
-            CausalConv3d(channels, channels, kernel_size=3),
-            nn.GroupNorm(32, channels),
-            nn.SiLU(),
-            nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
-            CausalConv3d(channels, channels, kernel_size=3),
+            # ── 第 1 层: 归一化 + 激活 + 卷积 ──
+            nn.GroupNorm(32, channels),            # 把 32 个通道编为一组做归一化，稳定训练
+            nn.SiLU(),                             # 激活函数: SiLU(x) = x · sigmoid(x)，比 ReLU 平滑
+            CausalConv3d(channels, channels, kernel_size=3),  # 3×3×3 因果卷积，提取时空特征
+            # ── 第 2 层: 再归一化 + 激活 + dropout + 卷积 ──
+            nn.GroupNorm(32, channels),            # 第二次归一化，防止中间值发散
+            nn.SiLU(),                             # 第二次激活
+            nn.Dropout(dropout) if dropout > 0 else nn.Identity(),  # 训练时随机丢弃部分神经元，防过拟合
+            CausalConv3d(channels, channels, kernel_size=3),  # 第二次卷积，输出与输入同通道数
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (B, C, T, H, W) → (B, C, T, H, W)"""
-        return x + self.block(x)
+        return x + self.block(x)  # 残差连接: 输出 = 输入 + 变换后的结果
 
 
 class ResBlockWithChannelChange(nn.Module):
@@ -425,6 +427,45 @@ class Encoder3D(nn.Module):
     │                                                                        │
     │  总压缩: 空间 8×, 时间 4×                                             │
     └────────────────────────────────────────────────────────────────────────┘
+
+    === 3D 卷积核的排列（关键理解） ===
+
+    以第一层 `Conv3d(3 → 128)` 为例：
+
+    ```
+    输入:  (B, 3, 96, 1088, 1920)  — 3 个通道, 每个是 96×1088×1920 的 3D 体
+              ↑
+    Conv3d(in=3, out=128, kernel=3×3×3)
+              ↓
+    核 shape: (128, 3, 3, 3, 3)
+              ↑   ↑   ↑  ↑  ↑
+           组数  每组的核 时 高 宽
+            128   3     3  3  3
+    ```
+
+    **总共 128 组，每组 3 个 3×3×3 的核，合计 384 个核。**
+
+    每组产出 1 个输出通道：
+
+    ```
+    第 0 组（输出通道 0）:
+      ├─ 核 [0,0,:,:,:] (3×3×3) ──→ 扫描输入通道 0
+      ├─ 核 [0,1,:,:,:] (3×3×3) ──→ 扫描输入通道 1
+      └─ 核 [0,2,:,:,:] (3×3×3) ──→ 扫描输入通道 2
+                                    ↓ 3个结果逐体素相加
+                              输出通道 0
+
+    ... 128 组同时工作 → 128 个输出通道
+    ```
+
+    **核心纠正**: 输出通道数 ≠ 输入通道数的倍数！
+    - 输入 3 只决定"每组里有几个核"（3 个）
+    - 输出 128 是你定的"组数"
+    - 同理最后 `Conv3d(512→8)` 是 8 组 × 每组 512 个核 → 输出 8 通道
+
+    为什么每组必须覆盖所有输入通道？
+    如果只用 1 个核扫通道 0，通道 1 和 2 的信息就全丢了！
+    所以每组核数 = 输入通道数，确保所有输入信息都被混合到每个输出通道。
     """
 
     def __init__(self, cfg: VAEConfig):

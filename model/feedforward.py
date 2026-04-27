@@ -74,3 +74,73 @@ class PositionwiseFeedForward(nn.Module):
     def forward(self, x):
         """(B, seq, d_model) → (B, seq, d_model)"""
         return self.net(x)
+
+
+class SwiGLUFeedForward(nn.Module):
+    """
+    SwiGLU 前馈网络 — Llama/Qwen/DeepSeek 等现代模型的标配 FFN。
+
+    与 ReLU FFN 的区别:
+      ReLU FFN:  Linear → ReLU → Linear  (2 个权重矩阵)
+      SwiGLU:    Linear(gate) + Linear(up) → SiLU(gate) * up → Linear(down)  (3 个权重矩阵)
+
+    为什么效果更好?
+      - SiLU 比 ReLU 平滑，梯度不会突然断裂
+      - 门控机制(gate * up): 像" selectively 放大某些特征，抑制另一些"
+      - 表达能力更强，训练更稳定
+
+    公式:
+      gate = x @ W_gate          → (B, seq, d_ff)
+      up   = x @ W_up            → (B, seq, d_ff)
+      hidden = SiLU(gate) * up   → (B, seq, d_ff)  ← 逐元素乘，门控激活
+      out = hidden @ W_down      → (B, seq, d_model)
+
+    其中 SiLU(x) = x * sigmoid(x) — 平滑的 ReLU 替代品
+
+    完整维度流转 (B=2, seq=5):
+
+      输入: (2, 5, 768)
+        │
+        ├─→ Linear(768 → 3072): gate  (2, 5, 3072)
+        │
+        ├─→ Linear(768 → 3072): up    (2, 5, 3072)
+        │
+        ▼ SiLU(gate) * up:             (2, 5, 3072)
+          SiLU: 平滑非线性，负数也有小梯度
+          * up: 门控，up 的值决定哪些特征通过
+        │
+        ▼ Linear(3072 → 768):          (2, 5, 768)
+        │
+        ▼ Dropout
+      输出: (2, 5, 768)
+
+    参数:
+        d_model: 输入输出维度 (768)
+        d_ff: 中间维度 (3072)
+        dropout: dropout 比例
+    """
+
+    def __init__(self, d_model: int, d_ff: int, dropout: float = 0.1):
+        super().__init__()
+        # gate: 门控信号，决定哪些特征通过
+        self.w_gate = nn.Linear(d_model, d_ff, bias=False)
+        # up: 上游特征，被 gate 调制
+        self.w_up = nn.Linear(d_model, d_ff, bias=False)
+        # down: 降维投影回 d_model
+        self.w_down = nn.Linear(d_ff, d_model, bias=False)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        """
+        x: (B, seq, d_model)
+        返回: (B, seq, d_model)
+        """
+        # gate: (B, seq, d_ff)
+        gate = self.w_gate(x)
+        # up: (B, seq, d_ff)
+        up = self.w_up(x)
+        # SiLU(gate) * up: 门控激活，(B, seq, d_ff)
+        # SiLU(x) = x * sigmoid(x)，比 ReLU 平滑
+        hidden = nn.functional.silu(gate) * up
+        # 降维 + dropout
+        return self.dropout(self.w_down(hidden))

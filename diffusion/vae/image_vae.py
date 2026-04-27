@@ -20,6 +20,7 @@ VAE 和普通 AutoEncoder 的区别？
   为什么要分布？因为采样有随机性，同一个图每次编码的结果略有不同，
   这让 latent 空间更"连续"——相邻的 latent 向量解码出来是类似的图。
   这样在 latent 空间做扩散时，生成质量更好。
+  什么是变分自编码器？"变分"指的是输出一个分布参数(μ和σ²)，而不是一个确定向量。
 
 整体流程图:
 
@@ -197,7 +198,8 @@ class ResBlock2D(nn.Module):
         self.act = nn.SiLU()
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
         # 通道数不同时, 用1×1卷积调整通道, 让 shortcut 能和主路径相加
-        self.shortcut = nn.Conv2d(in_ch, out_ch, kernel_size=1) if in_ch != out_ch else nn.Identity()
+        self.shortcut = nn.Conv2d(
+            in_ch, out_ch, kernel_size=1) if in_ch != out_ch else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """(B, C_in, H, W) → (B, C_out, H, W)  空间不变, 通道可变"""
@@ -356,7 +358,8 @@ class Downsample2D(nn.Module):
 
     def __init__(self, channels: int):
         super().__init__()
-        self.conv = nn.Conv2d(channels, channels, kernel_size=3, stride=2, padding=0)
+        self.conv = nn.Conv2d(channels, channels,
+                              kernel_size=3, stride=2, padding=0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = F.pad(x, (0, 1, 0, 1))  # 右边补1列, 下边补1行
@@ -525,7 +528,8 @@ class Encoder2D(nn.Module):
         channels = cfg.encoder_channels  # [128, 256, 512, 512]
 
         # 入口: 3通道→128通道, 空间不变
-        self.conv_in = nn.Conv2d(cfg.in_channels, channels[0], kernel_size=3, padding=1)
+        self.conv_in = nn.Conv2d(
+            cfg.in_channels, channels[0], kernel_size=3, padding=1)
 
         # 4个下采样级别
         self.down_blocks = nn.ModuleList()
@@ -639,7 +643,8 @@ class Decoder2D(nn.Module):
         rev_channels = list(reversed(channels))  # [512, 512, 256, 128]
 
         # latent → 512通道
-        self.conv_in = nn.Conv2d(cfg.latent_channels, rev_channels[0], kernel_size=3, padding=1)
+        self.conv_in = nn.Conv2d(
+            cfg.latent_channels, rev_channels[0], kernel_size=3, padding=1)
 
         # 瓶颈层 (和编码器一样)
         self.mid = nn.ModuleList([
@@ -676,7 +681,8 @@ class Decoder2D(nn.Module):
         self.conv_out = nn.Sequential(
             nn.GroupNorm(32, rev_channels[-1]),
             nn.SiLU(),
-            nn.Conv2d(rev_channels[-1], cfg.in_channels, kernel_size=3, padding=1),
+            nn.Conv2d(rev_channels[-1], cfg.in_channels,
+                      kernel_size=3, padding=1),
         )
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:

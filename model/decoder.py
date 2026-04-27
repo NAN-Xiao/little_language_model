@@ -24,9 +24,10 @@ import torch
 import torch.nn as nn
 
 from .attention import KVCache, MultiHeadAttention
-from .feedforward import PositionwiseFeedForward
+from .feedforward import PositionwiseFeedForward, SwiGLUFeedForward
 from .moe_feedforward import MoEFeedForward
 from .positional import SinusoidalPositionalEncoding
+from .rmsnorm import RMSNorm
 
 
 class DecoderBlock(nn.Module):
@@ -163,21 +164,30 @@ class DecoderBlock(nn.Module):
         moe_num_experts: int = 4,
         use_rope: bool = False,
         max_seq_len: int = 8192,
+        use_rmsnorm: bool = False,
+        use_swiglu: bool = False,
+        n_kv_heads: int | None = None,
     ):
         super().__init__()
         # 掩码自注意力: 每个token只看自己和之前的token
+        # n_kv_heads=None → 标准 MHA
+        # n_kv_heads=3  → GQA (12个Q头共享3套K/V)
         self.masked_self_attn = MultiHeadAttention(
             d_model, n_heads, dropout,
             use_rope=use_rope, max_seq_len=max_seq_len,
+            n_kv_heads=n_kv_heads,
         )
-        # FFN: 二选一 — 普通FFN 或 MoE FFN
-        self.ffn = (
-            MoEFeedForward(d_model, d_ff, moe_num_experts, dropout)
-            if use_moe
-            else PositionwiseFeedForward(d_model, d_ff, dropout)
-        )
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
+        # FFN: 三选一 — MoE FFN / SwiGLU FFN / ReLU FFN
+        if use_moe:
+            self.ffn = MoEFeedForward(d_model, d_ff, moe_num_experts, dropout)
+        elif use_swiglu:
+            self.ffn = SwiGLUFeedForward(d_model, d_ff, dropout)
+        else:
+            self.ffn = PositionwiseFeedForward(d_model, d_ff, dropout)
+        # 归一化: 二选一 — LayerNorm (原版Transformer) 或 RMSNorm (Llama/Qwen)
+        norm_cls = RMSNorm if use_rmsnorm else nn.LayerNorm
+        self.norm1 = norm_cls(d_model)
+        self.norm2 = norm_cls(d_model)
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
 
@@ -286,6 +296,9 @@ class Decoder(nn.Module):
         use_moe: bool = False,
         moe_num_experts: int = 4,
         use_rope: bool = False,
+        use_rmsnorm: bool = False,
+        use_swiglu: bool = False,
+        n_kv_heads: int | None = None,
     ):
         super().__init__()
         self.pad_token_id = pad_token_id
@@ -312,11 +325,15 @@ class Decoder(nn.Module):
                     d_model, n_heads, d_ff, dropout,
                     use_moe=use_moe, moe_num_experts=moe_num_experts,
                     use_rope=use_rope, max_seq_len=max_seq_len,
+                    use_rmsnorm=use_rmsnorm, use_swiglu=use_swiglu,
+                    n_kv_heads=n_kv_heads,
                 )
                 for _ in range(n_layers)
             ]
         )
-        self.norm = nn.LayerNorm(d_model)
+        # 最终归一化: 二选一
+        norm_cls = RMSNorm if use_rmsnorm else nn.LayerNorm
+        self.norm = norm_cls(d_model)
 
     def forward(
         self,

@@ -7,6 +7,57 @@ from pathlib import Path
 import torch
 
 
+def save_moe_experts(model: torch.nn.Module, save_dir: str | Path):
+    """
+    把 MoE 模型拆成 base + 独立专家文件保存。
+    只遍历 state_dict，不修改模型。
+    """
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    full_state = model.state_dict()
+    base_state: dict[str, torch.Tensor] = {}
+    expert_states: dict[tuple[int, int], dict[str, torch.Tensor]] = {}
+
+    for key, tensor in full_state.items():
+        if ".ffn.experts." in key:
+            parts = key.split(".")
+            # 定位 experts 的位置
+            for i, p in enumerate(parts):
+                if p == "experts":
+                    layer_idx = int(parts[i - 2])   # layers.N
+                    expert_idx = int(parts[i + 1])  # experts.N
+                    break
+            k = (layer_idx, expert_idx)
+            if k not in expert_states:
+                expert_states[k] = {}
+            expert_states[k][key] = tensor
+        else:
+            base_state[key] = tensor
+
+    torch.save(base_state, save_dir / "base.pt")
+    for (layer_idx, expert_idx), state in expert_states.items():
+        torch.save(state, save_dir / f"expert_layer{layer_idx}_expert{expert_idx}.pt")
+
+
+def load_moe_experts(model: torch.nn.Module, load_dir: str | Path):
+    """
+    从 base.pt + 独立专家文件加载 MoE 模型。
+    自动识别 load_dir 下的所有 expert_*.pt 文件。
+    """
+    load_dir = Path(load_dir)
+    state: dict[str, torch.Tensor] = {}
+
+    base_path = load_dir / "base.pt"
+    if base_path.exists():
+        state.update(torch.load(base_path, map_location="cpu", weights_only=False))
+
+    for expert_path in sorted(load_dir.glob("expert_layer*_expert*.pt")):
+        state.update(torch.load(expert_path, map_location="cpu", weights_only=False))
+
+    model.load_state_dict(state, strict=True)
+
+
 def get_logger(name: str = "lit-lm", level: int = logging.INFO) -> logging.Logger:
     logger = logging.getLogger(name)
     if not logger.handlers:

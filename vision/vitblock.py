@@ -1,30 +1,132 @@
 """
-Vision Transformer (ViT) 模块 —— 学习用实现
-==============================================
+Vision Transformer (ViT) 与图文多模态 —— 从"图像像素"到"文字描述"的完整旅程
+================================================================================
 
-本文件实现了：
-  1. PatchEmbedding        — 把图像切成固定大小的 patch，再线性投影到 d_model 维
-  2. ViTEncoderBlock       — 一个标准的 Transformer 编码器块（双向自注意力 + FFN）
-  3. VisionTransformer     — 完整的 ViT 图像分类模型（单图识别）
-  4. ImageTextProjector    — 将图像特征投影到文本 Decoder 的嵌入空间
-  5. VisionLanguageModel   — 图文多模态模型（ViT 编码图像 → 特征拼接到文本 token 前 → Decoder 生成）
+本文件实现了一条完整的流水线：
+  1. PatchEmbedding        — 把图像切成 patch，变成像文字 token 一样的序列
+  2. ViTBlock              — 一层 ViT: Attention + FFN（双向自注意力）
+  3. VisionTransformer     — 完整的图像分类模型（理解单张图）
+  4. ImageTextProjector    — 把图像特征"翻译"成文本能懂的语言
+  5. VisionLanguageModel   — 图文多模态：看图说话、图文问答
 
-核心思想：
-  ViT 把一张 2D 图像视为一串 1D 的 patch 序列，就像 NLP 中的 token 序列一样，
-  然后用标准的 Transformer Encoder 来建模 patch 之间的关系。
+═══════════════════════════════════════════════════════════════════════════════
+【核心问题：图像和文字怎么做注意力？】
+═══════════════════════════════════════════════════════════════════════════════
 
-  与 Decoder-Only 语言模型的区别：
-  ┌──────────────────────────────────────────────────────────────────┐
-  │             Decoder (语言模型)       │   Encoder (ViT)           │
-  │ ─────────────────────────────────── │ ───────────────────────── │
-  │ 因果掩码(causal mask)：只看过去      │ 无掩码：所有 patch 互相看  │
-  │ 输入是 token id → Embedding         │ 输入是 image → PatchEmbed │
-  │ 自回归生成                           │ 全局理解 / 分类           │
-  └──────────────────────────────────────────────────────────────────┘
+你可能已经熟悉了文字模型里的因果注意力（casual mask）：
+  "今天天气真好" → 模型只能从左往右看，预测下一个字。
 
-参考论文：
-  - "An Image is Worth 16x16 Words" (Dosovitskiy et al., 2020)
-  - "LLaVA: Large Language and Vision Assistant" (Liu et al., 2023)
+但图像是"一眼全看完"的——左上角的 patch 和右下角的 patch 是同时感知的。
+这就产生了两种注意力方式：
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                                                                             │
+│  图像内部注意力（ViT Encoder）                                              │
+│  ───────────────────────────                                                │
+│  没有 causal mask！所有 patch 互相可见。                                    │
+│                                                                             │
+│  例: 一张猫的图片                                                           │
+│      patch 0 (左上角背景) ←→ patch 50 (猫耳朵) ←→ patch 100 (猫尾巴)       │
+│      它们之间两两计算注意力，互相知道彼此的存在。                            │
+│                                                                             │
+│  这就像你一眼看完整张图，而不是从左到右扫描。                               │
+│                                                                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  图文混合注意力（VisionLanguageModel）                                      │
+│  ───────────────────────────────────                                        │
+│  图像 patch 和文字 token 拼成一个长序列：                                    │
+│                                                                             │
+│      [img0][img1]...[img195][文字][文字][文字]...                           │
+│       ↑ 图像部分（双向可见） ↑ |  ↑ 文字部分（因果可见）                     │
+│                                                                             │
+│  关键：整个序列一起过 causal mask，但 mask 的设计是"精华"：                │
+│                                                                             │
+│    • 图像 patch 之间：互相可见（双向）                                      │
+│    • 文字看图像：可见（文字可以参考图像内容）                                │
+│    • 文字看文字：只能看左边（因果）                                          │
+│    • 图像看文字：不可见（图像不需要知道后面的文字）                          │
+│                                                                             │
+│  这就像一个学生在看画报（图像）的同时写作文（文字）：                        │
+│    - 他可以随时回头看画报的任意部分                                         │
+│    - 但写字只能从左到右，不能跳到未来                                       │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+═══════════════════════════════════════════════════════════════════════════════
+【注意力掩码的矩阵可视化】
+═══════════════════════════════════════════════════════════════════════════════
+
+假设 4 个图像 token + 5 个文字 token，共 9 个位置：
+
+      img0 img1 img2 img3  txt0 txt1 txt2 txt3 txt4
+    ┌────┬────┬────┬────┬────┬────┬────┬────┬────┐
+img0│ 1  │ 1  │ 1  │ 1  │ 0  │ 0  │ 0  │ 0  │ 0  │  ← 图像看图像: 全可见
+img1│ 1  │ 1  │ 1  │ 1  │ 0  │ 0  │ 0  │ 0  │ 0  │
+img2│ 1  │ 1  │ 1  │ 1  │ 0  │ 0  │ 0  │ 0  │ 0  │
+img3│ 1  │ 1  │ 1  │ 1  │ 0  │ 0  │ 0  │ 0  │ 0  │
+    ├────┼────┼────┼────┼────┼────┼────┼────┼────┤
+txt0│ 1  │ 1  │ 1  │ 1  │ 1  │ 0  │ 0  │ 0  │ 0  │  ← 文字看图像+自己: 可见
+txt1│ 1  │ 1  │ 1  │ 1  │ 1  │ 1  │ 0  │ 0  │ 0  │     文字看未来文字: 不可见
+txt2│ 1  │ 1  │ 1  │ 1  │ 1  │ 1  │ 1  │ 0  │ 0  │
+txt3│ 1  │ 1  │ 1  │ 1  │ 1  │ 1  │ 1  │ 1  │ 0  │
+txt4│ 1  │ 1  │ 1  │ 1  │ 1  │ 1  │ 1  │ 1  │ 1  │
+    └────┴────┴────┴────┴────┴────┴────┴────┴────┘
+
+1 = 可见（可以 attend），0 = 被遮挡（不能 attend）
+
+这个 mask 的本质:
+  • 图像部分是一个"全1小方块"（双向注意力）
+  • 文字部分是一个"下三角"（因果注意力）
+  • 文字看图像的部分全是 1（文字可以参考图像）
+  • 图像看文字的部分全是 0（图像不依赖文字）
+
+═══════════════════════════════════════════════════════════════════════════════
+【为什么这样设计？】
+═══════════════════════════════════════════════════════════════════════════════
+
+1. 图像是"同时感知"的：
+   人眼看图不是逐字阅读，而是一眼扫全图。所以图像 patch 之间不该有顺序限制。
+
+2. 文字是"顺序生成"的：
+   生成第 N 个字时，不能偷看第 N+1 个字。所以文字部分保持因果 mask。
+
+3. 文字需要"看着图写"：
+   每个文字 token 都应该能参考所有图像 patch。否则模型在回答"图里有什么"时，
+   看不到图的内容。
+
+4. 图像不需要"看文字"：
+   图像编码在第一步就完成了，后续生成文字时不需要再修改图像表示。
+   这节省了计算，也符合直觉（图就是图，不因你写什么而改变）。
+
+═══════════════════════════════════════════════════════════════════════════════
+【从像素到文字的维度流转】
+═══════════════════════════════════════════════════════════════════════════════
+
+以 batch_size=2, image=224×224, patch=16×16, d_model=768, text_len=10 为例：
+
+  图像输入:     (2, 3, 224, 224)        2张RGB图
+      ↓
+  PatchEmbedding:  (2, 196, 768)        每张图切成14×14=196个patch，每个768维
+      ↓
+  + [CLS] token:   (2, 197, 768)        在前面加一个可学习的聚合token
+      ↓
+  + 位置编码:      (2, 197, 768)        每个位置学一个向量
+      ↓
+  ViT Encoder ×12: (2, 197, 768)        12层双向自注意力，patch之间互相理解
+      ↓
+  Projector:       (2, 197, 768)        投影到文本空间（如果vit_d和llm_d不同会变化）
+      ↓
+  文本嵌入:        (2, 10, 768)         "这是一只猫"的token embedding
+      ↓
+  拼接:            (2, 207, 768)        [图像197个 + 文字10个] 拼在一起
+      ↓
+  Causal Mask:     (1, 1, 207, 207)     上面画的那个特殊mask
+      ↓
+  Decoder Blocks:  (2, 207, 768)        文字token参考图像+前文，生成下一个字
+      ↓
+  Output Proj:     (2, 207, vocab_size) 每个位置预测下一个词的概率分布
+
 """
 
 from __future__ import annotations
@@ -35,150 +137,277 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from model.attention import MultiHeadAttention
+from vision.attention import ViTMultiHeadAttention
 from model.feedforward import PositionwiseFeedForward
 
 
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # 0. 配置
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 @dataclass
 class ViTConfig:
-    """ViT 相关的超参数。"""
-    image_size: int = 224          # 输入图像的边长（假设正方形）
-    patch_size: int = 16           # 每个 patch 的边长；224/16 = 14，共 14×14 = 196 个 patch
-    in_channels: int = 3           # 输入通道数（RGB = 3）
-    d_model: int = 768             # patch 投影后的维度，需与 Transformer 对齐
+    """
+    ViT 超参数配置。
+
+    关键数字关系:
+      image_size=224, patch_size=16 → num_patches = (224/16)² = 14×14 = 196
+      d_model=768 → 每个 patch 投影到 768 维（和文字模型的 d_model 对齐）
+      n_heads=12  → 和文字模型一致，方便共享或对接
+    """
+    patch_size: int = 16           # 每个 patch 的边长
+    in_channels: int = 3           # RGB = 3 通道
+    d_model: int = 768             # patch 投影后的维度
     n_heads: int = 12              # 注意力头数
-    n_layers: int = 12             # ViT 编码器的层数（ViT-Base = 12）
-    d_ff: int = 3072               # FFN 中间层维度（通常是 d_model × 4）
+    n_layers: int = 12             # ViT 编码器层数（ViT-Base = 12）
+    d_ff: int = 3072               # FFN 中间维度（通常 d_model × 4）
     dropout: float = 0.1           # dropout 比例
-    num_classes: int = 1000        # 分类类别数（ImageNet = 1000）
+    num_classes: int = 1000        # 图像分类类别数（ImageNet = 1000）
+    max_grid_size: int = 32        # 2D 位置编码的最大 grid 尺寸（支持 512×512 图 = 32×32 patch）
+    window_size: int = 0           # 窗口注意力大小，0=全局注意力（如 Swin 用 7）
 
 
-# ---------------------------------------------------------------------------
-# 1. Patch Embedding — 将图像切 patch 并投影
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. PatchEmbedding — 把"图像"切成"token"
+# ─────────────────────────────────────────────────────────────────────────────
 class PatchEmbedding(nn.Module):
     """
-    将一张图像切成不重叠的 patch，并通过线性投影映射到 d_model 维。
+    将 2D 图像转换成 1D token 序列。
 
-    实现方式：用一个 kernel_size = stride = patch_size 的 Conv2d 一步完成切分+投影。
-    这等价于：
-      1) 把图像按 patch_size 网格切成 N = (H/P) × (W/P) 个 patch
-      2) 每个 patch 展平为 P*P*C 维向量
-      3) 对每个向量做线性投影 → d_model 维
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │  生活类比: 把一张大照片剪成若干张小照片                                   │
+    │                                                                         │
+    │  原始照片: 224×224 像素                                                 │
+    │  每张小照片: 16×16 像素                                                 │
+    │  剪完后: 14 行 × 14 列 = 196 张小照片                                   │
+    │                                                                         │
+    │  每张小照片的内容（16×16×3=768个数字）被压平，然后投影到 d_model 维。     │
+    │  最终得到 196 个"视觉 token"，每个 768 维。                              │
+    │                                                                         │
+    │  这和 NLP 中的 Token Embedding 完全对应：                                │
+    │    NLP:  token id → Embedding Lookup → (seq, d_model)                  │
+    │    ViT:   图像像素 → Conv2d 切 patch   → (num_patches, d_model)         │
+    └─────────────────────────────────────────────────────────────────────────┘
 
-    ┌─────────────────────────────────────────────┐
-    │ 输入图像 (B, C, H, W)   例如 (B, 3, 224, 224)│
-    │                                             │
-    │ ┌────┬────┬────┬─···─┬────┐                 │
-    │ │p_1 │p_2 │p_3 │     │p_14│  ← 第1行14个patch│
-    │ ├────┼────┼────┼─···─┼────┤                 │
-    │ │p_15│p_16│    │     │p_28│  ← 第2行          │
-    │ ├────┼────┼────┼─···─┼────┤                 │
-    │ │ ...│    │    │     │ ...│                  │
-    │ ├────┼────┼────┼─···─┼────┤                 │
-    │ │p183│    │    │     │p196│  ← 第14行         │
-    │ └────┴────┴────┴─···─┴────┘                 │
-    │                                             │
-    │ 每个 patch: 16×16×3 = 768 维  → 投影到 d_model│
-    │ 输出: (B, 196, d_model)                      │
-    └─────────────────────────────────────────────┘
+    为什么用 Conv2d 实现？
+      kernel_size=16, stride=16 的卷积，恰好每次滑动 16 像素，
+      输出的每个"像素"就对应原图一个 16×16 的 patch。
+      这比先切 patch 再分别做 Linear 快得多，且数学等价。
 
-    参数:
-        image_size  (int): 输入图像的边长（假设正方形）
-        patch_size  (int): 每个 patch 的边长
-        in_channels (int): 输入图像的通道数（RGB = 3）
-        d_model     (int): 投影后的特征维度
+    维度流转:
+      输入:  (B, 3, 224, 224)
+      Conv:  (B, 768, 14, 14)   ← 768 是输出通道数 = d_model
+      Flat:  (B, 768, 196)      ← 把 14×14 压成一维
+      Trans: (B, 196, 768)      ← 把 patch 维放前面，和 NLP 序列对齐
     """
 
     def __init__(
         self,
-        image_size: int = 224,
         patch_size: int = 16,
         in_channels: int = 3,
         d_model: int = 768,
     ):
         super().__init__()
-        assert image_size % patch_size == 0, (
-            f"image_size ({image_size}) 必须能被 patch_size ({patch_size}) 整除"
-        )
-        self.num_patches = (image_size // patch_size) ** 2  # 196
+        self.patch_size = patch_size
 
-        # Conv2d(in_channels=3, out_channels=d_model, kernel=16, stride=16)
-        # 效果：每个 16×16 的区域被投影为一个 d_model 维向量
-        # 输出形状：(B, d_model, H/P, W/P) = (B, 768, 14, 14)
+        # Conv2d 一步完成"切 patch + 线性投影"
         self.projection = nn.Conv2d(
             in_channels, d_model,
             kernel_size=patch_size,
             stride=patch_size,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, tuple[int, int]]:
         """
-        Args:
-            x: 输入张量，形状为 (B, C, H, W)，例如 (B, 3, 224, 224)
-        Returns:
-            输出张量，形状为 (B, num_patches, d_model)，例如 (B, 196, 768)
+        Qwen2-VL 风格：支持任意输入尺寸，自动 pad，返回 grid_size。
+
+        输入:  (B, C, H, W)  任意尺寸，例: (2, 3, 300, 400)
+        输出:  (x, (H_p, W_p))
+            x:    (B, num_patches, d_model)  例: (2, 475, 768)
+            H_p:  patch 的行数  例: 19
+            W_p:  patch 的列数  例: 25
         """
+        B, C, H, W = x.shape
 
-        # 用卷积将每个 patch 映射到 d_model 维，输出形状: (B, d_model, H/P, W/P)，例如 (B, 768, 14, 14)
-        # transpose(1, 2) 交换第 1 维和第 2 维: (B, 768, 196) → (B, 196, 768)，即 (B, num_patches, d_model)
-        # 将空间维 (H/P, W/P) 展平成一个 patch 维度: (B, d_model, 14, 14) → (B, d_model, 196)
-        x = x.flatten(2)
-        # 交换 d_model 和 patch 维度，得到 (B, 196, 768)，即 (B, num_patches, d_model)
-        x = x.transpose(1, 2)
-        # 就是图像的embeding  和文字对齐的吗？
-        # 文字embeding的形状是
-        return x
+        # 自动 pad 到 patch_size 的整数倍（右和下补零）
+        pad_h = (self.patch_size - H % self.patch_size) % self.patch_size
+        pad_w = (self.patch_size - W % self.patch_size) % self.patch_size
+        if pad_h > 0 or pad_w > 0:
+            x = F.pad(x, (0, pad_w, 0, pad_h))
+
+        x = self.projection(x)        # (B, d_model, H_p, W_p)
+        B, C, H_p, W_p = x.shape
+        x = x.flatten(2)              # (B, d_model, H_p * W_p)
+        x = x.transpose(1, 2)         # (B, num_patches, d_model)
+        return x, (H_p, W_p)
 
 
-# ---------------------------------------------------------------------------
-# 2. ViT Encoder Block — 双向自注意力 + FFN
-# ---------------------------------------------------------------------------
-class ViTEncoderBlock(nn.Module):
+# ─────────────────────────────────────────────────────────────────────────────
+# 1.5 PosEmbed2D — Qwen2-VL 风格 2D 位置编码
+# ─────────────────────────────────────────────────────────────────────────────
+class PosEmbed2D(nn.Module):
     """
-    一个标准的 Transformer Encoder 块，用于 ViT。
+    2D 位置编码 —— 让模型知道每个 patch 在原图的"行列坐标"。
 
-    与 decoder.py 中的 DecoderBlock 相比：
-      - DecoderBlock 使用 *因果掩码* (causal mask)，每个位置只能看到之前的 token
-      - ViTEncoderBlock *不使用掩码*，每个 patch 可以关注所有其他 patch（双向注意力）
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │  和 1D 位置编码的区别：                                                  │
+    │                                                                         │
+    │  1D 位置编码（原版 ViT）:                                                │
+    │    每个位置学一个向量，位置 0,1,2,...,196 各不同                         │
+    │    问题: 不知道"位置 15"是在第1行第15列还是第2行第1列                  │
+    │                                                                         │
+    │  2D 位置编码（Qwen2-VL）:                                                │
+    │    分别学"行位置"和"列位置"，然后拼接                                  │
+    │    patch(i,j) 的位置编码 = [row_embed[i], col_embed[j]]                │
+    │    → 模型知道 (i,j) 的空间关系                                         │
+    │                                                                         │
+    │  例: 14×14 的 patch grid                                               │
+    │    patch(0,0):  [row[0], col[0]]  ← 左上角                             │
+    │    patch(0,13): [row[0], col[13]] ← 右上角                             │
+    │    patch(13,0): [row[13], col[0]] ← 左下角                             │
+    │                                                                         │
+    │  为什么比 1D 好？                                                        │
+    │    1. 尺度不变性: 28×28 的大图和 14×14 的小图共享行/列编码             │
+    │    2. 空间关系明确: 模型知道"左边""右边""上面""下面"                   │
+    │    3. 支持动态分辨率: 任意大小的图都能加位置编码                         │
+    │                                                                         │
+    │  实现方式: 可学习的 embedding（不是正弦/RoPE）                           │
+    │    和原版 ViT 一样用 nn.Parameter，但分成 row 和 col 两个矩阵          │
+    └─────────────────────────────────────────────────────────────────────────┘
 
-    结构（Pre-Norm 风格，与本项目 DecoderBlock 一致）：
-      x  ──→ LayerNorm → MultiHeadAttention → Dropout → (+残差) ──→
-         ──→ LayerNorm → FFN                → Dropout → (+残差) ──→ out
+    维度流转:
+      row_embed: (1, max_grid_size, d_model//2)  例: (1, 32, 384)
+      col_embed: (1, max_grid_size, d_model//2)  例: (1, 32, 384)
 
-    参数:
-        d_model (int):  特征维度
-        n_heads (int):  注意力头数
-        d_ff    (int):  FFN 中间层维度
-        dropout (float): dropout 比例
+      输入 x: (B, num_patches, d_model)  例: (2, 196, 768)
+      grid: (14, 14)
+
+      row[:14]: (1, 14, 384) → expand → (1, 14, 14, 384)
+      col[:14]: (1, 14, 384) → expand → (1, 14, 14, 384)
+      cat: (1, 14, 14, 768) → reshape → (1, 196, 768)
+
+      x + pos: (2, 196, 768) + (1, 196, 768) → broadcast
     """
 
-    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float = 0.1):
+    def __init__(self, d_model: int, max_grid_size: int = 32):
         super().__init__()
-        # 复用已有的多头注意力和前馈网络实现
-        self.self_attn = MultiHeadAttention(d_model, n_heads, dropout)
+        assert d_model % 2 == 0, "d_model 必须是偶数 (row 和 col 各一半)"
+        self.d_model = d_model
+        self.max_grid_size = max_grid_size
+
+        # 行位置编码 + 列位置编码，各 d_model/2 维
+        self.row_embed = nn.Parameter(
+            torch.zeros(1, max_grid_size, d_model // 2))
+        self.col_embed = nn.Parameter(
+            torch.zeros(1, max_grid_size, d_model // 2))
+
+        nn.init.trunc_normal_(self.row_embed, std=0.02)
+        nn.init.trunc_normal_(self.col_embed, std=0.02)
+
+    def forward(
+        self, x: torch.Tensor, grid_size: tuple[int, int]
+    ) -> torch.Tensor:
+        """
+        x:         (B, num_patches, d_model)
+        grid_size: (H_p, W_p)  patch 的行数和列数
+        返回:      (B, num_patches, d_model)
+        """
+        h, w = grid_size
+        assert h <= self.max_grid_size and w <= self.max_grid_size, (
+            f"grid_size ({h}, {w}) 超过 max_grid_size ({self.max_grid_size})"
+        )
+
+        # 取前 h 个行编码和前 w 个列编码
+        row = self.row_embed[:, :h, :]   # (1, h, d/2)
+        col = self.col_embed[:, :w, :]   # (1, w, d/2)
+
+        # 扩展并组合
+        # row: (1, h, 1, d/2) → (1, h, w, d/2)
+        # col: (1, 1, w, d/2) → (1, h, w, d/2)
+        row = row.unsqueeze(2).expand(-1, -1, w, -1)
+        col = col.unsqueeze(1).expand(-1, h, -1, -1)
+
+        # 拼接: (1, h, w, d_model)
+        pos = torch.cat([row, col], dim=-1)
+
+        # reshape 成和 x 对齐的序列格式: (1, h*w, d_model)
+        pos = pos.reshape(1, h * w, self.d_model)
+
+        return x + pos  # broadcast: (B, N, d) + (1, N, d)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. ViTBlock — 一层 ViT（Attention + FFN）
+# ─────────────────────────────────────────────────────────────────────────────
+class ViTBlock(nn.Module):
+    """
+    ViT 的 Encoder 块 —— 和文字 Decoder 块的核心区别在这里！
+
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │                                                                         │
+    │  DecoderBlock (你的语言模型)     vs      ViTBlock (一层图像编码器)        │
+    │  ──────────────────────────              ─────────────────────          │
+    │                                                                         │
+    │  LayerNorm → Attention + mask        LayerNorm → Attention (无mask)     │
+    │       ↓                                    ↓                            │
+    │  残差连接                            残差连接                           │
+    │       ↓                                    ↓                            │
+    │  LayerNorm → FFN                   LayerNorm → FFN                      │
+    │       ↓                                    ↓                            │
+    │  残差连接                            残差连接                           │
+    │                                                                         │
+    │  【关键区别: mask】                                                     │
+    │                                                                         │
+    │  DecoderBlock: mask = 下三角矩阵                                       │
+    │    → 每个 token 只能看自己和之前的 token                                │
+    │    → 适合自回归生成                                                    │
+    │                                                                         │
+    │  ViTBlock: mask = None                                                │
+    │    → 每个 patch 可以看所有其他 patch（包括未来的）                        │
+    │    → 适合全局理解图像                                                  │
+    │                                                                         │
+    │  类比:                                                                  │
+    │    Decoder 像写日记——今天只能回忆过去，不能预知明天。                     │
+    │    Encoder 像看照片——一眼扫过去，所有细节同时进入视野。                   │
+    │                                                                         │
+    └─────────────────────────────────────────────────────────────────────────┘
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        d_ff: int,
+        dropout: float = 0.1,
+        window_size: int = 0,
+        shift_size: int = 0,
+    ):
+        super().__init__()
+        self.self_attn = ViTMultiHeadAttention(
+            d_model, n_heads, dropout,
+            window_size=window_size, shift_size=shift_size)
         self.ffn = PositionwiseFeedForward(d_model, d_ff, dropout)
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        grid_size: tuple[int, int] | None = None,
+    ) -> torch.Tensor:
         """
-        x: (B, seq_len, d_model)   seq_len = num_patches + 1（含 [CLS]）
+        x: (B, seq_len, d_model)   seq_len = num_patches
+        grid_size: (H_p, W_p) — patch 的行列数，窗口注意力需要
         返回: (B, seq_len, d_model)
-
-        注意：这里 *没有* mask 参数，因为图像 patch 之间是双向可见的，
-        不需要因果掩码，也没有 padding（图像尺寸固定）。
         """
         # --- 自注意力子层 ---
         normed = self.norm1(x)
-        # query = key = value = normed → 自注意力，mask=None → 双向
-        x = x + self.dropout1(self.self_attn(normed,
-                              normed, normed, mask=None))
+        # query = key = value
+        # grid_size 传给 attention，如果配置了 window_size 就启用窗口注意力
+        x = x + self.dropout1(
+            self.self_attn(normed, normed, normed, mask=None, grid_size=grid_size)
+        )
 
         # --- 前馈网络子层 ---
         normed = self.norm2(x)
@@ -186,167 +415,170 @@ class ViTEncoderBlock(nn.Module):
         return x
 
 
-# ---------------------------------------------------------------------------
-# 3. VisionTransformer — 完整的图像分类模型（单图识别）
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. VisionTransformer — 完整的图像理解模型
+# ─────────────────────────────────────────────────────────────────────────────
 class VisionTransformer(nn.Module):
     """
-    完整的 Vision Transformer (ViT)，用于图像分类。
+    完整的 ViT，用于把图像编码成一组向量。
 
-    整体流程：
-    ┌─────────────────────────────────────────────────────────────────┐
-    │                                                                 │
-    │  Image (B,3,224,224)                                            │
-    │      │                                                          │
-    │      ▼                                                          │
-    │  PatchEmbedding  →  (B, 196, 768)                               │
-    │      │                                                          │
-    │      ▼                                                          │
-    │  Prepend [CLS] token  →  (B, 197, 768)                         │
-    │      │               ↑                                          │
-    │      │   + Learnable Position Embedding (1, 197, 768)           │
-    │      ▼                                                          │
-    │  ViTEncoderBlock × N  →  (B, 197, 768)                         │
-    │      │                                                          │
-    │      ▼                                                          │
-    │  LayerNorm                                                      │
-    │      │                                                          │
-    │      ▼                                                          │
-    │  取 [CLS] 输出 → (B, 768)                                       │
-    │      │                                                          │
-    │      ▼                                                          │
-    │  Classification Head (Linear) → (B, num_classes)                │
-    │                                                                 │
-    └─────────────────────────────────────────────────────────────────┘
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │  Qwen2-VL 风格整体流程（以 224×224 图像为例）:                            │
+    │                                                                         │
+    │  Image (B, 3, 224, 224)                                                 │
+    │      │                                                                  │
+    │      ▼                                                                  │
+    │  PatchEmbedding  →  (B, 196, 768), grid=(14,14)                        │
+    │      │                    ↑ 196 个视觉 token                            │
+    │      │                    ↑ 支持任意分辨率！                            │
+    │      ▼                                                                  │
+    │  + PosEmbed2D(grid=(14,14))  →  (B, 196, 768)                          │
+    │      │                    ↑ 每个 patch 知道自己在原图的行列位置          │
+    │      │                    ↑ 例: patch 15 = 第1行第15列                 │
+    │      ▼                                                                  │
+    │  Encoder × 12  →  (B, 196, 768)                                        │
+    │      │                    ↑ 经过 12 层双向注意力，patch 之间充分交流     │
+    │      ▼                                                                  │
+    │  LayerNorm                                                              │
+    │      │                                                                  │
+    │      ▼                                                                  │
+    │  全局平均池化  →  (B, 768)                                              │
+    │      │                    ↑ 所有 patch 取平均，比 [CLS] 更稳定          │
+    │      ▼                                                                  │
+    │  Classification Head  →  (B, num_classes)                               │
+    │                                                                         │
+    └─────────────────────────────────────────────────────────────────────────┘
 
-    [CLS] token 的作用：
-      - 一个可学习的向量，拼接在 patch 序列的最前面
-      - 经过多层 Encoder 后，[CLS] 聚合了全图信息
-      - 最终用 [CLS] 的输出做分类（类似 BERT 的 [CLS]）
+    和原版 ViT 的关键区别:
+    ────────────────────────
+    1. 去掉 [CLS] token
+       Qwen2-VL 不用 [CLS]，而是直接用所有 patch token
+       分类时用"全局平均池化"替代 [CLS]
 
-    位置编码：
-      - ViT 原版使用 *可学习的* 位置编码（nn.Parameter），而非正弦位置编码
-      - 每个位置（包括 [CLS]）有一个可训练的 d_model 维向量
+    2. 2D 位置编码 (PosEmbed2D)
+       替代 1D 可学习位置编码
+       模型知道每个 patch 的二维空间位置
 
-    参数:
-        cfg (ViTConfig): ViT 配置
+    3. 动态分辨率
+       支持任意输入尺寸，patch 数量随图像大小变化
+       不再需要固定 image_size=224
     """
 
     def __init__(self, cfg: ViTConfig):
         super().__init__()
         self.cfg = cfg
 
-        # --- Patch Embedding ---
+        # Patch Embedding: 任意尺寸图像 → token 序列
         self.patch_embed = PatchEmbedding(
-            image_size=cfg.image_size,
             patch_size=cfg.patch_size,
             in_channels=cfg.in_channels,
             d_model=cfg.d_model,
         )
-        num_patches = self.patch_embed.num_patches  # 196
 
-        # --- [CLS] Token ---
-        # 可学习的 [CLS] token，形状 (1, 1, d_model)
-        # 训练时会随梯度更新，最终学会聚合全局图像信息
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, cfg.d_model))
-
-        # --- 可学习位置编码 ---
-        # num_patches + 1 是因为要给 [CLS] 也分配一个位置编码
-        # 与 positional.py 中的正弦编码不同，这里是全可学习的
-        self.pos_embed = nn.Parameter(
-            torch.zeros(1, num_patches + 1, cfg.d_model))
-
+        # 2D 位置编码: 替代 1D 可学习位置编码 + [CLS]
+        self.pos_embed = PosEmbed2D(
+            d_model=cfg.d_model,
+            max_grid_size=cfg.max_grid_size,
+        )
         self.pos_drop = nn.Dropout(cfg.dropout)
 
-        # --- Encoder Blocks ---
+        # Encoder Blocks
+        # Encoder Blocks —— 偶数层正常窗口，奇数层 Shifted Window
+        # Shifted Window 让相邻窗口的 patch 能交互，解决窗口注意力的"盲区"
+        shift_size = cfg.window_size // 2 if cfg.window_size > 0 else 0
         self.blocks = nn.ModuleList([
-            ViTEncoderBlock(cfg.d_model, cfg.n_heads, cfg.d_ff, cfg.dropout)
-            for _ in range(cfg.n_layers)
+            ViTBlock(
+                cfg.d_model, cfg.n_heads, cfg.d_ff, cfg.dropout,
+                window_size=cfg.window_size,
+                shift_size=shift_size if i % 2 == 1 else 0,  # 奇数层偏移
+            )
+            for i in range(cfg.n_layers)
         ])
 
         self.norm = nn.LayerNorm(cfg.d_model)
-
-        # --- 分类头 ---
         self.head = nn.Linear(cfg.d_model, cfg.num_classes)
 
         self._init_weights()
 
     def _init_weights(self):
-        # 位置编码用截断正态分布初始化
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
-        nn.init.trunc_normal_(self.cls_token, std=0.02)
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.trunc_normal_(m.weight, std=0.02)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def forward_features(self, pixel_values: torch.Tensor) -> torch.Tensor:
+    def forward_features(
+        self, pixel_values: torch.Tensor
+    ) -> tuple[torch.Tensor, tuple[int, int]]:
         """
-        提取图像特征（不含分类头），供外部模型（如多模态）复用。
+        提取图像特征（不含分类头），供多模态模型复用。
 
-        pixel_values: (B, C, H, W) 例如 (B, 3, 224, 224)
-        返回: (B, num_patches + 1, d_model) — 含 [CLS] 的完整序列特征
+        输入:  (B, C, H, W)  任意尺寸
+        输出:  (x, grid_size)
+            x:         (B, num_patches, d_model)  所有 patch token
+            grid_size: (H_p, W_p)  patch 的行列数
         """
-        B = pixel_values.size(0)
+        # 1) Patch Embedding: 任意尺寸 → patch tokens
+        x, grid_size = self.patch_embed(pixel_values)
+        # x: (B, num_patches, d_model)
 
-        # 1) Patch embedding: (B, 3, 224, 224) → (B, 196, 768)
-        x = self.patch_embed(pixel_values)
-
-        # 2) 在最前面拼接 [CLS] token
-        #    cls_token.expand(B, -1, -1) 把 (1,1,768) 扩展为 (B,1,768)
-        cls_tokens = self.cls_token.expand(B, -1, -1)
-        x = torch.cat([cls_tokens, x], dim=1)  # (B, 197, 768)
-
-        # 3) 加上位置编码
-        # (B, 197, 768) + (1, 197, 768) → broadcast → (B, 197, 768)
-        x = x + self.pos_embed
+        # 2) 加 2D 位置编码
+        # 每个 patch 知道自己在原图的行列位置
+        x = self.pos_embed(x, grid_size)
         x = self.pos_drop(x)
 
-        # 4) 通过 N 层 Encoder Block
+        # 3) 通过 N 层 Encoder（双向自注意力）
+        # 把 grid_size 传给每一层，窗口注意力需要知道 patch 的 2D 布局
         for block in self.blocks:
-            x = block(x)
+            x = block(x, grid_size=grid_size)
 
-        # 5) 最终 LayerNorm
         x = self.norm(x)
-        return x
+        return x, grid_size
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         """
-        图像分类的 forward。
+        图像分类 forward。
 
-        pixel_values: (B, C, H, W)
-        返回: (B, num_classes) — 未经 softmax 的 logits
-
-        使用示例:
-            cfg = ViTConfig(num_classes=10)
-            model = VisionTransformer(cfg)
-            images = torch.randn(4, 3, 224, 224)   # batch of 4 images
-            logits = model(images)                  # (4, 10)
-            loss = F.cross_entropy(logits, labels)
+        输入:  (B, C, H, W)
+        输出:  (B, num_classes) — 未经 softmax 的 logits
         """
-        x = self.forward_features(pixel_values)  # (B, 197, 768)
-        cls_output = x[:, 0]  # 取 [CLS] token 的输出: (B, 768)
-        logits = self.head(cls_output)  # (B, num_classes)
+        x, _ = self.forward_features(pixel_values)  # (B, N, d_model)
+        # 全局平均池化: 所有 patch 取平均，替代 [CLS]
+        x = x.mean(dim=1)   # (B, d_model)
+        logits = self.head(x)
+        # 返回的这个logits是什么？
+        # 它是模型对每个类别的预测分数，未经 softmax 转换成概率。维度是 (B, num_classes)，
         return logits
 
 
-# ---------------------------------------------------------------------------
-# 4. Image-Text Projector — 图像特征 → 文本嵌入空间
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. ImageTextProjector — "翻译官"：把图像语言翻译成文字语言
+# ─────────────────────────────────────────────────────────────────────────────
 class ImageTextProjector(nn.Module):
     """
-    将 ViT 输出的图像特征投影到与文本 Decoder 相同的嵌入空间。
+    将 ViT 输出的图像特征投影到文本 Decoder 的嵌入空间。
 
-    很多多模态模型（LLaVA、Qwen-VL 等）的核心思路就是：
-      图像特征 (来自 ViT)  ──→  投影层  ──→  与文本 token embedding 拼接  ──→  送入 Decoder
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │  为什么需要 Projector？                                                 │
+    │                                                                         │
+    │  想象两个说不同语言的人：                                               │
+    │    ViT 说的是"图像语"（视觉特征空间）                                   │
+    │    Decoder 说的是"文字语"（词嵌入空间）                                  │
+    │                                                                         │
+    │  Projector 就是翻译官，把"图像语"翻译成"文字语"，                       │
+    │  这样两者才能在同一张桌子上开会（同一个序列里做注意力）。                 │
+    │                                                                         │
+    │  为什么不是简单的 Linear？                                              │
+    │    两层 MLP + GELU 的表达能力更强，能学到更复杂的映射关系。              │
+    │    就像专业翻译不只是逐字翻，还要理解语境。                              │
+    └─────────────────────────────────────────────────────────────────────────┘
 
-    本投影器使用两层 MLP + GELU 激活：
-      Linear(vit_d_model → llm_d_model) → GELU → Linear(llm_d_model → llm_d_model)
+    维度流转:
+      输入:  (B, num_image_tokens, vit_d_model)  例: (2, 197, 768)
+      输出:  (B, num_image_tokens, llm_d_model)  例: (2, 197, 768)
 
-    参数:
-        vit_d_model (int): ViT 输出的特征维度
-        llm_d_model (int): 文本 Decoder 的特征维度
+    如果 vit_d_model ≠ llm_d_model（比如 ViT 用 1024，LLM 用 768），
+    Projector 会自动做维度对齐。
     """
 
     def __init__(self, vit_d_model: int, llm_d_model: int):
@@ -365,62 +597,74 @@ class ImageTextProjector(nn.Module):
         return self.proj(image_features)
 
 
-# ---------------------------------------------------------------------------
-# 5. VisionLanguageModel — 图文多模态理解
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. VisionLanguageModel — 图文多模态：看图说话
+# ─────────────────────────────────────────────────────────────────────────────
 class VisionLanguageModel(nn.Module):
     """
-    图文多模态模型：将图像理解与文本生成结合。
+    图文多模态模型 —— 核心问题"图像和文字怎么做注意力"的答案在这里！
 
-    整体架构（类似 LLaVA 的简化版）：
+    ═══════════════════════════════════════════════════════════════════════════
+    【架构总览：拼接 + 统一自注意力】
+    ═══════════════════════════════════════════════════════════════════════════
+
+    本模型采用"拼接序列 + 统一 causal attention"的方案（LLaVA 风格），
+    而不是单独的 cross-attention（CLIP 风格）。
+
     ┌─────────────────────────────────────────────────────────────────────────┐
+    │  方案对比:                                                              │
     │                                                                         │
-    │  Image (B,3,224,224)          Text token ids (B, T)                     │
-    │      │                            │                                     │
-    │      ▼                            ▼                                     │
-    │  VisionTransformer          Token Embedding                             │
-    │  (forward_features)         (from Decoder)                              │
-    │      │                            │                                     │
-    │      ▼                            │                                     │
-    │  (B, N_img, vit_d)                │                                     │
-    │      │                            │                                     │
-    │      ▼                            │                                     │
-    │  ImageTextProjector               │                                     │
-    │      │                            │                                     │
-    │      ▼                            ▼                                     │
-    │  (B, N_img, d_model)     (B, T, d_model)                               │
-    │      │                        │                                         │
-    │      └────── concat ──────────┘                                         │
-    │                  │                                                       │
-    │                  ▼                                                       │
-    │  Combined: (B, N_img + T, d_model)                                      │
-    │                  │                                                       │
-    │                  ▼                                                       │
-    │   + Position Encoding                                                   │
-    │                  │                                                       │
-    │                  ▼                                                       │
-    │  Decoder Blocks (causal mask)                                           │
-    │                  │                                                       │
-    │                  ▼                                                       │
-    │  Output Projection → (B, N_img + T, vocab_size)                         │
-    │                  │                                                       │
-    │                  ▼                                                       │
-    │  取文本部分 logits → 计算 loss / 生成文本                                │
+    │  本模型用的方案（拼接 + 自注意力）:                                     │
+    │    [img0][img1]...[img195][txt0][txt1][txt2]...                        │
+    │      ↓ 一起过 causal mask（图像全可见，文字因果可见）                   │
+    │    → 所有 token 互相 attention                                         │
+    │                                                                         │
+    │  另一种方案（Cross-Attention，如 Flamingo）:                           │
+    │    图像 → ViT → 固定特征                                               │
+    │    文字 → Decoder 的每一层都额外做一次 cross-attention 到图像特征       │
+    │                                                                         │
+    │  为什么选拼接方案？                                                     │
+    │    1. 简单: 复用已有的 Decoder，不需要改 attention 结构                 │
+    │    2. 灵活: 图像 token 和文字 token 平等参与，交互更充分                │
+    │    3. 高效: 一次前向传播搞定，不需要每层的 cross-attention               │
     │                                                                         │
     └─────────────────────────────────────────────────────────────────────────┘
 
-    工作原理：
-      1. ViT 编码图像为一组 "视觉 token"
-      2. Projector 将视觉 token 对齐到文本嵌入空间
-      3. 视觉 token 拼接在文本 token 前面
-      4. 整个序列送入因果 Decoder，像处理普通文本一样做自回归生成
-      5. 模型看到图像+问题，就能生成回答（图文问答）
+    ═══════════════════════════════════════════════════════════════════════════
+    【Causal Mask 的具体构造】
+    ═══════════════════════════════════════════════════════════════════════════
 
-    参数:
-        vit       (VisionTransformer): 预训练好的 ViT 图像编码器
-        decoder   (nn.Module):         已有的文本 Decoder（从 Transformer 中获取）
-        projector (ImageTextProjector): 图文投影层
-        cfg       (ModelConfig-like):   需包含 vocab_size, d_model, pad_token_id 等
+    这是图文多模态最核心的代码细节：
+
+    假设 num_image_tokens = 196（14×14 patches，无 [CLS]）
+    假设 text_len = 10
+    总序列长度 = 206
+
+    mask 是一个 207×207 的矩阵，分为四个区域：
+
+                    图像(197)      文字(10)
+                  ┌──────────┬──────────┐
+        图像(197) │   全1    │    全0   │   ← 图像看图像: OK；图像看文字: 不需要
+                  ├──────────┼──────────┤
+        文字(10)  │   全1    │  下三角  │   ← 文字看图像: OK；文字看文字: 因果
+                  └──────────┴──────────┘
+
+    代码实现:
+      1. 先构造一个标准的下三角 causal mask (207, 207)
+      2. 把"图像看文字"的区域（前 197 行，后 10 列）设为 0
+      3. 把"图像看图像"的区域（前 197 行，前 197 列）设为 1
+
+    但实际上，当前的实现是用了一个"简化版"mask：
+      对整个序列（图像+文字）统一用下三角 causal mask。
+
+    这意味着：
+      • 图像 patch 之间: 由于是序列开头，下三角 = 全可见 ✓
+      • 文字看图像: 图像在前，文字在后，下三角 = 可见 ✓
+      • 文字看文字: 下三角 = 因果 ✓
+      • 图像看文字: 图像在前，文字在后，下三角 = 不可见 ✓
+
+    完美！一个普通的下三角 mask 恰好实现了我们想要的所有约束，
+    不需要额外的复杂逻辑。这就是为什么"拼接 + causal mask"方案如此优雅。
     """
 
     def __init__(
@@ -434,32 +678,62 @@ class VisionLanguageModel(nn.Module):
     ):
         super().__init__()
         self.vit = vit
-        self.decoder = decoder           # Decoder from decoder.py
-        self.output_proj = output_proj   # Linear(d_model, vocab_size)
+        self.decoder = decoder
+        self.output_proj = output_proj
         self.projector = projector
         self.pad_token_id = pad_token_id
 
-        # 通常在多模态训练中冻结 ViT，只训练 projector 和 decoder
+        # 多模态训练中通常冻结 ViT，只训练 Projector 和 Decoder
+        # 原因: ViT 已经在大规模图像数据上预训练过，特征提取能力已很强
+        #       我们只需要学"怎么把图像特征和文字对齐"
         if freeze_vit:
             for p in self.vit.parameters():
                 p.requires_grad = False
 
-    def _make_causal_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
+    def _make_causal_mask(
+        self,
+        seq_len: int,
+        num_image_tokens: int,
+        device: torch.device,
+    ) -> torch.Tensor:
         """
-        构建因果掩码（下三角矩阵），用于 Decoder 的自回归约束。
+        构建图文混合的因果掩码。
+
+        纯下三角 mask 不能让图像 patch 之间全可见（img0 只能看自己）。
+        正确的掩码分四块：
+
+              ┌─────────────┬─────────────┐
+              │  图像部分   │  文字部分   │
+        ┌─────┼─────────────┼─────────────┤
+        │图像 │   全 1      │   全 0      │  ← 图像互相可见，不看文字
+        ├─────┼─────────────┼─────────────┤
+        │文字 │   全 1      │   下三角    │  ← 文字看图像+因果看自己
+        └─────┴─────────────┴─────────────┘
+
+        参数:
+            seq_len:          总序列长度（图像token数 + 文字token数）
+            num_image_tokens: 图像token数量
+            device:           目标设备
 
         返回: (1, 1, seq_len, seq_len) — 可广播到 (B, n_heads, seq_len, seq_len)
-
-        示例 (seq_len=5):
-          [[1, 0, 0, 0, 0],
-           [1, 1, 0, 0, 0],
-           [1, 1, 1, 0, 0],
-           [1, 1, 1, 1, 0],
-           [1, 1, 1, 1, 1]]
         """
-        mask = torch.tril(torch.ones(seq_len, seq_len,
-                          device=device, dtype=torch.bool))
-        return mask.unsqueeze(0).unsqueeze(0)  # (1, 1, S, S)
+        mask = torch.zeros(seq_len, seq_len, device=device, dtype=torch.bool)
+
+        # 图像部分：所有图像 patch 互相可见（左上全1方块）
+        mask[:num_image_tokens, :num_image_tokens] = True
+
+        # 文字部分：文字看图像全可见 + 文字之间因果可见
+        text_start = num_image_tokens
+        if text_start < seq_len:
+            # 文字看所有图像（左下全1矩形）
+            mask[text_start:, :num_image_tokens] = True
+            # 文字之间因果（右下下三角）
+            text_len = seq_len - text_start
+            causal = torch.tril(torch.ones(
+                text_len, text_len, device=device, dtype=torch.bool))
+            mask[text_start:, text_start:] = causal
+
+        return mask.unsqueeze(0).unsqueeze(0)
 
     def forward(
         self,
@@ -471,63 +745,89 @@ class VisionLanguageModel(nn.Module):
 
         参数:
             pixel_values: (B, C, H, W) — 输入图像
-            input_ids:    (B, T)       — 输入文本的 token id 序列
+            input_ids:    (B, T)       — 输入文本的 token id
 
         返回:
-            logits: (B, N_img + T, vocab_size) — 完整序列的预测 logits
-                    训练时通常只对文本部分计算 loss
+            logits: (B, N_img + T, vocab_size)
 
-        使用示例（训练）:
-            # 假设已经构建好模型
-            logits = model(images, text_ids)
-            # 只对文本区域计算 loss
-            num_img_tokens = model.get_num_image_tokens()
-            text_logits = logits[:, num_img_tokens:-1, :]   # 去掉最后一个预测
-            text_targets = text_ids[:, 1:]                   # shifted targets
-            loss = F.cross_entropy(
-                text_logits.reshape(-1, text_logits.size(-1)),
-                text_targets.reshape(-1),
-                ignore_index=model.pad_token_id,
-            )
+        维度流转示例 (B=2, 图像=224×224, 文本=10个token):
+
+          pixel_values:    (2, 3, 224, 224)
+              ↓
+          vit.forward_features:  (2, 197, 768)     ← 图像特征（含[CLS]）
+              ↓
+          projector:       (2, 197, 768)           ← 投影到文本空间
+              ↓
+          text_embeds:     (2, 10, 768)            ← "这是猫"的 embedding
+              ↓
+          cat:             (2, 207, 768)           ← [图像197 + 文字10]
+              ↓
+          pos_encoding:    (2, 207, 768)           ← 加位置信息
+              ↓
+          causal_mask:     (1, 1, 207, 207)        ← 下三角mask
+              ↓
+          Decoder Blocks:  (2, 207, 768)           ← 注意力计算
+              ↓
+          output_proj:     (2, 207, vocab_size)    ← 预测下一个词
+
+        训练时 loss 只算文字部分：
+          模型已经看到了图像+前面的文字，要预测下一个文字。
+          图像部分的输出不需要计算 loss（它们不是"词"）。
         """
-        # ---- 图像编码 ----
-        # (B, N_img+1, vit_d_model)  含 [CLS]
-        image_features = self.vit.forward_features(pixel_values)
-        # 投影到文本空间: (B, N_img+1, llm_d_model)
+        # ─── 图像编码（只做一次）───
+        # Qwen2-VL 风格: 支持任意分辨率，返回所有 patch token（无 [CLS]）
+        # (B, num_patches, vit_d_model)
+        image_features, grid_size = self.vit.forward_features(pixel_values)
+        # 投影到文本空间: (B, num_patches, llm_d_model)
         image_embeds = self.projector(image_features)
 
-        # ---- 文本嵌入 ----
-        # 直接复用 Decoder 的 token_embedding
+        # ─── 文本嵌入 ───
+        # 复用 Decoder 的 token_embedding
         d_model = self.decoder.d_model
         text_embeds = self.decoder.token_embedding(
             input_ids) * (d_model ** 0.5)
-        # (B, T, d_model)
 
-        # ---- 拼接：[图像 tokens | 文本 tokens] ----
+        # ─── 拼接：[图像 tokens | 文本 tokens] ───
+        # 这是多模态的核心：图像和文字在同一个序列里
+        # 它们通过自注意力自然交互——文字 token 会 attend 到图像 token
         combined = torch.cat([image_embeds, text_embeds], dim=1)
-        # (B, N_img+1+T, d_model)
 
         total_len = combined.size(1)
 
-        # ---- 位置编码 ----
+        # ─── 位置编码 ───
         combined = self.decoder.pos_encoding(combined)
 
-        # ---- 因果掩码 ----
-        causal_mask = self._make_causal_mask(total_len, combined.device)
+        # ─── 因果掩码 ───
+        # 下三角 mask 恰好实现所有约束:
+        #   - 图像 patch 之间: 全可见（在序列开头）
+        #   - 文字看图像: 可见（图像在文字前面）
+        #   - 文字看文字: 因果（下三角）
+        #   - 图像看文字: 不可见（不需要）
+        num_image_tokens = image_embeds.size(1)
+        causal_mask = self._make_causal_mask(
+            total_len, num_image_tokens, combined.device)
 
-        # ---- 通过 Decoder Blocks ----
+        # ─── 通过 Decoder Blocks ───
         x = combined
         for layer in self.decoder.layers:
             x = layer(x, tgt_mask=causal_mask)
         x = self.decoder.norm(x)
 
-        # ---- 输出投影 ----
-        logits = self.output_proj(x)  # (B, N_img+1+T, vocab_size)
+        # ─── 输出投影 ───
+        logits = self.output_proj(x)  # (B, num_patches + text_len, vocab_size)
         return logits
 
-    def get_num_image_tokens(self) -> int:
-        """返回图像编码后产生的 token 数量（含 [CLS]）。"""
-        return self.vit.patch_embed.num_patches + 1
+    def get_num_image_tokens(self, pixel_values: torch.Tensor | None = None) -> int:
+        """
+        返回图像编码后产生的 token 数量（不含 [CLS]，纯 patch 数）。
+
+        如果提供了 pixel_values，动态计算；否则返回默认值 196。
+        """
+        if pixel_values is not None:
+            _, grid_size = self.vit.forward_features(pixel_values)
+            return grid_size[0] * grid_size[1]
+        # 默认 224×224, patch=16 → 14×14 = 196
+        return 196
 
     @torch.no_grad()
     def generate(
@@ -540,14 +840,24 @@ class VisionLanguageModel(nn.Module):
         top_k: int = 0,
     ) -> torch.Tensor:
         """
-        图文多模态生成：给定图像和提示文本，自回归生成回答。
+        图文多模态生成：给定图像和提示，自回归生成回答。
+
+        生成过程:
+          1. 图像编码一次（固定不变）
+          2. 文本逐 token 生成，每步都把已生成的文本和图像重新拼接
+          3. 模型参考图像+已生成文字，预测下一个词
+
+        例:
+          图像: [一只猫的照片]
+          提示: "这张图里有什么？"
+          生成: "图" → "里" → "有" → "一" → "只" → "猫" → "。" → <eos>
 
         参数:
-            pixel_values:   (B, C, H, W)
+            pixel_values:   (B, C, H, W) — 输入图像
             input_ids:      (B, T) — 提示文本
             max_new_tokens: 最大生成 token 数
             eos_token_id:   结束符 id
-            temperature:    采样温度
+            temperature:    采样温度（越高越随机）
             top_k:          top-k 采样
 
         返回:
@@ -555,9 +865,9 @@ class VisionLanguageModel(nn.Module):
         """
         self.eval()
 
-        # 图像编码（只需做一次）
-        image_features = self.vit.forward_features(pixel_values)
-        image_embeds = self.projector(image_features)  # (B, N_img, d)
+        # 图像编码（只需做一次，因为图不变）
+        image_features, _ = self.vit.forward_features(pixel_values)
+        image_embeds = self.projector(image_features)
 
         generated = input_ids.clone()
         finished = torch.zeros(input_ids.size(
@@ -569,19 +879,22 @@ class VisionLanguageModel(nn.Module):
             text_embeds = self.decoder.token_embedding(
                 generated) * (d_model ** 0.5)
 
-            # 拼接
+            # 拼接图像 + 当前已生成的文本
             combined = torch.cat([image_embeds, text_embeds], dim=1)
             total_len = combined.size(1)
             combined = self.decoder.pos_encoding(combined)
 
-            causal_mask = self._make_causal_mask(total_len, combined.device)
+            num_image_tokens = image_embeds.size(1)
+            causal_mask = self._make_causal_mask(
+                total_len, num_image_tokens, combined.device)
 
+            # 前向传播
             x = combined
             for layer in self.decoder.layers:
                 x = layer(x, tgt_mask=causal_mask)
             x = self.decoder.norm(x)
 
-            # 只取最后一个位置的 logits
+            # 只取最后一个位置的 logits（预测下一个词）
             next_logits = self.output_proj(
                 x[:, -1, :]) / max(temperature, 1e-5)
 
@@ -591,7 +904,7 @@ class VisionLanguageModel(nn.Module):
                 next_logits[next_logits < top_k_vals[:, -1:]] = float("-inf")
 
             probs = F.softmax(next_logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)  # (B, 1)
+            next_token = torch.multinomial(probs, num_samples=1)
             next_token = next_token.masked_fill(
                 finished.unsqueeze(1), self.pad_token_id)
 
@@ -603,38 +916,35 @@ class VisionLanguageModel(nn.Module):
         return generated
 
 
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # 快捷构建函数
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 def build_vision_language_model(
     vit_cfg: ViTConfig,
     llm_transformer: nn.Module,
     freeze_vit: bool = True,
 ) -> VisionLanguageModel:
     """
-    快捷构建 VisionLanguageModel。
+    快捷构建 VisionLanguageModel —— Qwen2-VL 风格。
 
     参数:
-        vit_cfg:         ViT 配置
-        llm_transformer: 已有的 Transformer 实例（来自 transformer.py）
-        freeze_vit:      是否冻结 ViT 参数
-
-    返回:
-        VisionLanguageModel 实例
+        vit_cfg:         ViT 配置（不再需要 image_size）
+        llm_transformer: 已有的 Transformer 实例
+        freeze_vit:      是否冻结 ViT 参数（推荐 True）
 
     使用示例:
-        from little_language_model.config import ModelConfig, ViTConfig
-        from little_language_model.model.transformer import Transformer
+        from config import ModelConfig, ViTConfig
+        from model.transformer import Transformer
 
-        model_cfg = ModelConfig(vocab_size=16000, d_model=768)
-        llm = Transformer(model_cfg)
-
-        vit_cfg = ViTConfig(d_model=768, num_classes=0)  # num_classes 在多模态中不需要
+        llm = Transformer(ModelConfig(d_model=768))
+        vit_cfg = ViTConfig(d_model=768, num_classes=0, max_grid_size=32)
         vlm = build_vision_language_model(vit_cfg, llm, freeze_vit=True)
 
-        images = torch.randn(2, 3, 224, 224)
+        # 支持任意分辨率！
+        images = torch.randn(2, 3, 224, 224)   # 224×224 → 196 tokens
+        large_images = torch.randn(2, 3, 448, 448)  # 448×448 → 784 tokens
         text_ids = torch.randint(0, 16000, (2, 32))
-        logits = vlm(images, text_ids)
+        logits = vlm(images, text_ids)  # (2, 228, vocab_size)
     """
     vit = VisionTransformer(vit_cfg)
     projector = ImageTextProjector(

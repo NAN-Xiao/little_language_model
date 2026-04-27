@@ -37,6 +37,9 @@ class ModelConfig:
     use_moe: bool = False
     moe_num_experts: int = 4
     moe_lb_coeff: float = 0.01
+    use_rmsnorm: bool = True  # True=RMSNorm(Llama风格), False=LayerNorm(原版Transformer风格)
+    use_swiglu: bool = True   # True=SwiGLU(Llama风格), False=ReLU FFN(原版Transformer风格)
+    n_kv_heads: int | None = None  # None=标准MHA, 3=GQA(12个Q头共享3套K/V), 1=MQA
 
 
 @dataclass
