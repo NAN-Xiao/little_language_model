@@ -127,7 +127,7 @@ class MultiHeadAttention(nn.Module):
         mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
-        注意力的核心计算 —— 打分 + 加权混合。
+        注意力的核心计算 —— 打分 + 加权混合。qkv的计算在这
 
         用具体数字理解 (假设 B=1, 头数=1, 句子只有3个词):
 
@@ -415,6 +415,9 @@ class MultiHeadAttention(nn.Module):
             k = torch.cat([k_prev, k], dim=2)  # 沿 seq_len 维度拼接
             v = torch.cat([v_prev, v], dim=2)
 
+        # 保存原始 K/V 用于 KV-Cache（必须存 repeat 之前的 n_kv_heads 版本）
+        k_raw, v_raw = k, v
+
         # ═══ Step 4.5: GQA — K/V 重复 ═══
         # GQA 时 K/V 只有 n_kv_heads 个，需要重复 n_rep 次才能和 Q 的 n_heads 匹配
         # 例: n_kv_heads=3, n_heads=12 → n_rep=4
@@ -491,4 +494,5 @@ class MultiHeadAttention(nn.Module):
         # w_o 让每个位置的信息在各头之间"交流"，不是简单拼接
         # 同时返回 (k, v) 用于 KV-Cache
         # 输出形状: (B, seq, 768) —— 和输入一样，但内容融合了上下文
-        return self.w_o(attn_output), (k, v)
+        # 返回 k_raw/v_raw（repeat 之前的 n_kv_heads 版本），保证下次拼接 shape 匹配
+        return self.w_o(attn_output), (k_raw, v_raw)
