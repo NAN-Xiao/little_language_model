@@ -370,86 +370,56 @@ class Transformer(nn.Module):
             # 最后一个位置已经"看完"了所有历史，最适合预测下一个
             logits = logits[:, -1, :]
 
-            # temperature: 控制随机性，除法放缩分数
-            # temperature→0: 最确定的词分数更高，趋近 argmax
-            # temperature→∞: 所有词概率趋近相等，完全随机
-            logits = logits / max(temperature, 1e-5)
-
-            # 最少生成字数: 前 min_new_tokens 步禁止生成 eos
-            if step_idx < min_new_tokens:
-                logits[:, eos_token_id] = float("-inf")
-
-            # repetition_penalty: 惩罚已出现的词，避免重复
-            # >1 时，对已出现词的分数进行打压 (正数除，负数乘，都是远离0)
-            if repetition_penalty and repetition_penalty != 1.0:
-                token_ids = generated             # 已生成的所有 token
-                gathered = logits.gather(1, token_ids)  # 取出这些 token 当前分数
-                # 分数>0 就除，分数<0 就乘，都是让它离0更远(概率更低)
-                adjusted = torch.where(
-                    gathered < 0,
-                    gathered * repetition_penalty,
-                    gathered / repetition_penalty,
-                )
-                logits.scatter_(1, token_ids, adjusted)
+            # repetition_penalty: 降低已出现词的重复概率
+            if repetition_penalty != 1.0:
+                for b in range(batch_size):
+                    if finished[b]:
+                        continue
+                    for token_id in generated[b].unique():
+                        token_id = int(token_id)
+                        if logits[b, token_id] > 0:
+                            logits[b, token_id] /= repetition_penalty
+                        else:
+                            logits[b, token_id] *= repetition_penalty
 
             # no_repeat_ngram_size: 禁止重复 n-gram
-            # 例如 n=3，已出现 "天气真"，则下一个词不能是"好"(如果会构成重复)
-            if no_repeat_ngram_size and no_repeat_ngram_size > 1:
-                n = int(no_repeat_ngram_size)
-                if generated.size(1) >= n - 1:
-                    prefix = generated[:, -(n - 1):].tolist()  # 最近 n-1 个 token
-                    full = generated.tolist()
-                    for b in range(batch_size):
-                        if finished[b]:
-                            continue
-                        banned: set[int] = set()
-                        seq = full[b]
-                        pre = prefix[b]
-                        limit = len(seq) - (n - 1)
-                        # 遍历历史，找到所有会导致重复 n-gram 的下一个词
-                        for i in range(max(0, limit)):
-                            if seq[i: i + (n - 1)] == pre:
-                                banned.add(seq[i + (n - 1)])
-                        if banned:
-                            logits[b, list(banned)] = float("-inf")
+            if no_repeat_ngram_size > 0:
+                n = no_repeat_ngram_size
+                for b in range(batch_size):
+                    if finished[b]:
+                        continue
+                    seq = generated[b].tolist()
+                    banned = set()
+                    prefix = seq[-(n - 1):] if len(seq) >= n - 1 else seq
+                    limit = len(seq) - (n - 1)
+                    for i in range(max(0, limit)):
+                        if seq[i:i + (n - 1)] == prefix:
+                            banned.add(seq[i + (n - 1)])
+                    if banned:
+                        logits[b, list(banned)] = float("-inf")
 
-            # top_k: 只保留概率最高的 k 个候选，其余设 -inf
-            # 例如 top_k=50: 即使词表有 68 个词，也只考虑分数最高的 50 个
+            # top_k: 固定数量筛选。只保留分数最高的 k 个词，其余强制排除。
+            # 实现：找到第 k 高的分数作为阈值，低于它的全部设为 -inf（softmax 后概率为 0）
             if top_k > 0:
                 top_k_vals, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                # 低于第 k 高的全部设成 -inf
                 logits[logits < top_k_vals[:, -1:]] = float("-inf")
 
-            # top_p (nucleus sampling): 从"累计概率"角度筛选
-            # 例如 top_p=0.9: 从高到低排，取最小集合使累计概率≥0.9
-            # 这样可能取 5 个词(它们概率本来就集中)，也可能取 30 个词
+            # top_p (nucleus sampling): 动态数量筛选。按概率从高到低累加，
+            # 取累计概率达到 p 的最小词集，其余排除。比 top_k 更自适应。
+            # 例如 top_p=0.9: 若前3个词概率和已达0.9，则只留这3个；若很分散则可能留30个。
             if top_p < 1.0:
-                sorted_logits, sorted_indices = torch.sort(
-                    logits, descending=True)
-                cumulative_probs = torch.cumsum(
-                    F.softmax(sorted_logits, dim=-1), dim=-1
-                )
-                # 找到累计概率超过 top_p 的位置，把它们去掉
-                sorted_mask = (
-                    cumulative_probs -
-                    F.softmax(sorted_logits, dim=-1) >= top_p
-                )
+                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                # 累计概率超过 top_p 的位置（及之后的所有词）设为 -inf
+                sorted_mask = (cumulative_probs - F.softmax(sorted_logits, dim=-1) >= top_p)
                 sorted_logits[sorted_mask] = float("-inf")
-                # 把处理后的分数按原顺序放回
-                logits = sorted_logits.scatter(
-                    1, sorted_indices, sorted_logits)
+                logits = sorted_logits.scatter(1, sorted_indices, sorted_logits)
 
-            # 分数 → 概率: softmax 后每行和为 1
-            # probs是一个概率分布，表示在当前上下文下每个词被选中的概率。
-            # 形状是 (B, vocab_size)，每行是一个样本的概率分布。
-            #     probs = [0.05, 0.001, 0.02, 0.85, 0.005, 0.02, 0.055]
-            #   ↑      ↑      ↑     ↑      ↑      ↑      ↑
-            #  词0    词1    词2   词3    词4    词5    词6
-
+            # softmax: 将 logits 转换为概率分布。此前被设为 -inf 的词，e^(-inf)=0，概率为 0。
             probs = F.softmax(logits, dim=-1)
 
-            # 多项式采样: 按概率随机选一个，不是直接 argmax
-            # 分数高的词被选中的概率大，但低分词也有机会
+            # 多项式采样：按概率加权随机抽取一个词，不是直接取 argmax。
+            # 这样高分词大概率被选中，但低分词也有小概率"爆冷"。
             next_token = torch.multinomial(probs, num_samples=1)
 
             # 已完成的序列继续输出 pad (而不是 eos)，保持 batch 形状一致
@@ -467,5 +437,5 @@ class Transformer(nn.Module):
             finished = finished | (next_token.squeeze(1) == eos_token_id)
             if finished.all():    # 所有样本都结束了，提前退出
                 break
-
+        #generated是token id 的序列，形状 (B, seq)，包含了输入的 prompt 和生成的新 token。
         return generated

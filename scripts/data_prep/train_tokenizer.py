@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 
-from data.tokenizer import SentencePieceTokenizer
+from tokenizer.tokenizer import SentencePieceTokenizer
 
 
 def parse_args() -> argparse.Namespace:

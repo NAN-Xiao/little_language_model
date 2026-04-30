@@ -8,7 +8,7 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader, Dataset, IterableDataset
 
-from .tokenizer import SentencePieceTokenizer
+from ..tokenizer.tokenizer import SentencePieceTokenizer
 
 TINY_SHAKESPEARE_URL = (
     "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"

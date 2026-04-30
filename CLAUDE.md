@@ -100,3 +100,64 @@ Experimental modules not yet integrated into the main training pipeline:
 - Checkpoint format: dict with keys `epoch`, `step`, `model_state_dict`, `optimizer_state_dict`, `loss`. Naming convention: `best_model.pt` (best val loss), `checkpoint_epoch{N}.pt` (periodic), `interrupted.pt` (Ctrl+C). LoRA saves as `best_lora.pt` / `lora_epoch{N}.pt` / `interrupted_lora.pt`.
 - Learning rate schedules: `transformer` (Vaswani decay), `warmup_const` (linear warmup then constant, default), `const` (fixed). All respect `min_lr` floor.
 - Mixed precision: `auto` prefers bf16 if supported, falls back to fp16. GradScaler only enabled for fp16 on CUDA.
+
+## Text Generation & Sampling Parameters
+
+The `Transformer.generate()` method in [model/transformer.py](model/transformer.py) implements the full decoding pipeline. Below is how each parameter transforms the raw model logits into the next token.
+
+### Pipeline Overview
+
+```
+raw logits → temperature → repetition_penalty → no_repeat_ngram → top_k → top_p → softmax → multinomial sampling
+```
+
+Each step modifies the `logits` array; setting a position to `-inf` makes its probability zero after softmax.
+
+### Parameter Details
+
+**`temperature`**
+Divides all logits. Scales the distribution sharpness without changing the ranking.
+- `< 1` (e.g. 0.7): gaps widen → softmax is sharper → high-scoring tokens dominate → more deterministic
+- `= 1`: no change
+- `> 1` (e.g. 1.5): gaps shrink → softmax is flatter → more random/creative
+- `→ 0` approaches argmax; `→ ∞` approaches uniform
+
+**`repetition_penalty`**
+Reduces probability of already-generated tokens. Applied to every token in `generated`.
+- Positive logit: `logit / penalty` (moves toward zero from above)
+- Negative logit: `logit * penalty` (moves toward zero from below)
+- In both cases the absolute value shrinks, so after softmax the probability drops.
+
+**`no_repeat_ngram_size`**
+Prevents repeating n-grams. If `n=3` and `"天气真"` already appeared, the next token cannot be `"好"` if that would recreate the exact 3-gram. Works by scanning history and banning matching continuation tokens (set to `-inf`).
+
+**`top_k`**
+Fixed-count filtering. Keeps only the `k` highest-scoring tokens; everything else becomes `-inf`.
+- Simple and fast, but rigid: always keeps exactly `k` tokens even if the distribution is very flat or very peaked.
+
+**`top_p` (nucleus sampling)**
+Dynamic-count filtering based on cumulative probability.
+1. Sort tokens by score descending
+2. Compute softmax probabilities
+3. Accumulate probabilities from the top down
+4. Keep the smallest set whose cumulative probability ≥ `p`
+5. Discard the rest (`-inf`)
+- More adaptive than `top_k`: if the top few tokens already account for 90% of probability, only those are kept; if probability is spread out, many more are retained.
+
+**`min_new_tokens`**
+Forces the model to generate at least this many tokens before it is allowed to emit `eos`. Implemented by setting `logits[:, eos_token_id] = -inf` for the first `min_new_tokens` steps.
+
+### Softmax & Sampling
+
+After all filters, `F.softmax(logits)` converts scores to probabilities. Tokens previously set to `-inf` get probability 0 and can never be selected.
+
+`torch.multinomial(probs, 1)` draws one token according to the probability distribution. Unlike `argmax`, this is stochastic: high-probability tokens are likely to win, but low-probability tokens still have a chance.
+
+### Common Combinations
+
+| Scenario | Suggested Settings |
+|----------|-------------------|
+| Creative writing | `temperature=1.2`, `top_p=0.9` |
+| Factual Q&A | `temperature=0.7`, `top_p=0.95` |
+| Code generation | `temperature=0.2`, `top_p=0.95`, `repetition_penalty=1.1` |
+| Prevent repetition | `repetition_penalty=1.2`, `no_repeat_ngram_size=3` |

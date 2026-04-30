@@ -20,7 +20,7 @@ import torch.nn as nn
 
 from config import ModelConfig, FinetuneConfig, LoRAConfig
 from data.dataset import create_dataloaders, create_qa_dataloaders
-from data.tokenizer import SentencePieceTokenizer
+from tokenizer.tokenizer import SentencePieceTokenizer
 from model import Transformer
 from model.lora import (
     apply_lora, get_lora_parameters, save_lora, load_lora,

@@ -17,6 +17,7 @@ class SentencePieceTokenizer:
     UNK_TOKEN = "<unk>"
 
     def __init__(self, model_path: str | Path):
+        """加载已训练好的 SentencePiece 模型。"""
         self.model_path = Path(model_path)
         self.processor = spm.SentencePieceProcessor(model_file=str(self.model_path))
         self.vocab_size = self.processor.vocab_size()
@@ -38,12 +39,14 @@ class SentencePieceTokenizer:
         return int(self.processor.unk_id())
 
     def encode(self, text: str, add_special: bool = True) -> list[int]:
+        """将文本编码为 token ID 列表；默认在首尾添加 <bos> 和 <eos>。"""
         ids = list(self.processor.encode(text, out_type=int))
         if add_special:
             ids = [self.bos_token_id] + ids + [self.eos_token_id]
         return ids
 
     def decode(self, ids: list[int], skip_special: bool = True) -> str:
+        """将 token ID 列表解码为文本；默认跳过特殊 token。"""
         if skip_special:
             special_ids = {
                 self.pad_token_id,
@@ -54,6 +57,7 @@ class SentencePieceTokenizer:
         return self.processor.decode(ids)
 
     def save(self, path: str | Path):
+        """保存模型文件（.model）和元数据文件（.json）到指定路径。"""
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         target = path if path.suffix == ".model" else path.with_suffix(".model")
@@ -75,6 +79,7 @@ class SentencePieceTokenizer:
 
     @classmethod
     def load(cls, path: str | Path) -> SentencePieceTokenizer:
+        """从 .model 或 .json 元数据文件加载 tokenizer。"""
         path = Path(path)
         if path.suffix == ".json":
             meta = json.loads(path.read_text(encoding="utf-8"))
@@ -98,16 +103,13 @@ class SentencePieceTokenizer:
         sample_rate: float = 1.0,        # 从语料中随机采样的概率，减小可降低资源消耗，取值范围(0,1]
         sample_seed: int = 42,           # 随机采样种子，保证采样实验可复现
     ) -> SentencePieceTokenizer:
-        """""
-        1. 创建模型保存前缀相关的目录，确保分词器模型可以正确写入目标位置
-        """""
+        """基于语料训练一个新的 SentencePiece tokenizer，并返回实例。"""
+        # 创建模型保存前缀相关的目录，确保分词器模型可以正确写入目标位置
         model_prefix = Path(model_prefix)
         model_prefix.parent.mkdir(parents=True, exist_ok=True)
 
-        """""
-        2. 构建临时训练语料文件，并按设定随机采样/截断，将清洗后的训练文本写入spm_corpus.txt
-           通过write_corpus_text支持从多种格式与数据源读取
-        """""
+        # 构建临时训练语料文件，并按设定随机采样/截断，将清洗后的训练文本写入 spm_corpus.txt
+        # 通过 write_corpus_text 支持从多种格式与数据源读取
         with tempfile.TemporaryDirectory() as tmpdir:
             corpus_path = Path(tmpdir) / "spm_corpus.txt"
             _, written_lines = write_corpus_text(
@@ -121,11 +123,9 @@ class SentencePieceTokenizer:
                 f"Prepared tokenizer corpus: {written_lines:,} lines "
                 f"(sample_rate={sample_rate}, sample_seed={sample_seed})"
             )
-            """""
-            3. 用 SentencePieceTrainer 加载语料并训练分词器模型；参数里详细指定模型类型、词表大小、特殊符号、字符覆盖率、
-               归一化规则等，避免中文或特殊数据训练异常；模型最终存储到模型前缀位置
-                    那整个 spm.SentencePieceTrainer.train是黑盒的，我们只需要知道它需要什么参数，然后给它就可以了
-            """""
+            # 用 SentencePieceTrainer 加载语料并训练分词器模型；参数里详细指定模型类型、词表大小、特殊符号、字符覆盖率、
+            # 归一化规则等，避免中文或特殊数据训练异常；模型最终存储到模型前缀位置
+            # spm.SentencePieceTrainer.train 是黑盒的，只需要知道它需要什么参数，然后给它就可以了
             spm.SentencePieceTrainer.train(
                 input=str(corpus_path),
                 model_prefix=str(model_prefix),
@@ -145,24 +145,19 @@ class SentencePieceTokenizer:
                 max_sentence_length=16384,
                 hard_vocab_limit=False,
             )
-        """""
-        4. 返回已训练的SentencePieceTokenizer对象，加载生成的.model模型权重
-        """""
+        # 返回已训练的 SentencePieceTokenizer 对象，加载生成的 .model 模型权重
         return cls(model_prefix.with_suffix(".model"))
 
 
 def iter_corpus_text(data_path: str | Path):
-    """""
-    1. 遍历数据源，支持多种格式(.txt/.json/.jsonl/.tsv)，自动递归处理目录
-    """""
+    """按行迭代语料文本，自动识别 .txt/.json/.jsonl/.tsv 及目录。"""
+    # 遍历数据源，支持多种格式(.txt/.json/.jsonl/.tsv)，自动递归处理目录
     path = Path(data_path)
     if path.is_dir():
         for file_path in path.glob("*"):
             yield from iter_corpus_text(file_path)
         return
-    """""
-    3. 处理单个文件，支持文本(.txt)、JSON(.json/.jsonl)、TSV(.tsv)格式
-    """""
+    # 处理单个文件，支持文本(.txt)、JSON(.json/.jsonl)、TSV(.tsv)格式
     if path.suffix.lower() == ".txt":
         with path.open("r", encoding="utf-8", errors="replace") as handle:
             for line in handle:
@@ -219,9 +214,8 @@ def write_corpus_text(
     sample_rate: float = 1.0,
     sample_seed: int = 42,
 ) -> tuple[Path, int]:
-    """""
-    1. 确保输出路径目录存在，并创建临时训练语料文件，按设定随机采样/截断，将清洗后的训练文本写入spm_corpus.txt
-    """""
+    """读取原始语料，经过采样后写入统一的训练文本文件，返回 (输出路径, 写入行数)。"""
+    # 确保输出路径目录存在，并创建临时训练语料文件，按设定随机采样/截断，将清洗后的训练文本写入 spm_corpus.txt
     if not (0.0 < sample_rate <= 1.0):
         raise ValueError("sample_rate must be in the range (0, 1].")
     output_path = Path(output_path)
@@ -250,9 +244,8 @@ def ensure_tokenizer(
     sample_rate: float = 1.0,      # 训练时对语料采样的概率，(0, 1]，减少数据量可加快速度
     sample_seed: int = 42,         # 采样随机种子，保证采样复现性
 ) -> SentencePieceTokenizer:
-    """""
-    1. 如果需要重新训练分词器，则调用SentencePieceTokenizer.train()，否则调用SentencePieceTokenizer.load()
-    """""
+    """若模型文件已存在且未指定 retrain，则直接加载；否则重新训练。"""
+    # 如果需要重新训练分词器，则调用 SentencePieceTokenizer.train()，否则调用 SentencePieceTokenizer.load()
     tokenizer_path = Path(tokenizer_path)
     model_path = tokenizer_path if tokenizer_path.suffix == ".model" else tokenizer_path.with_suffix(".model")
     if retrain or not model_path.exists():

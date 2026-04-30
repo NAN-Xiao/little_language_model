@@ -10,7 +10,7 @@ import argparse
 import torch
 
 from config import ModelConfig, LoRAConfig
-from data.tokenizer import SentencePieceTokenizer
+from tokenizer.tokenizer import SentencePieceTokenizer
 from model import Transformer
 from model.lora import apply_lora, load_lora
 from utils import get_device, get_logger

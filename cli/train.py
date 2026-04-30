@@ -197,7 +197,7 @@ from data.dataset import (
     create_qa_dataloaders,
     download_tiny_shakespeare,
 )
-from data.tokenizer import ensure_tokenizer
+from tokenizer.tokenizer import ensure_tokenizer
 from model import Transformer
 from model.moe_feedforward import collect_moe_load_balance_loss
 from utils import (
