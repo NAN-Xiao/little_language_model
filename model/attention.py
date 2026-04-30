@@ -91,14 +91,20 @@ class MultiHeadAttention(nn.Module):
         dropout: 随机丢弃比例，防止过拟合
     """
 
-    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1,
-                 use_rope: bool = False, max_seq_len: int = 8192,
-                 n_kv_heads: int | None = None):
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        dropout: float = 0.1,
+        use_rope: bool = False,
+        max_seq_len: int = 8192,
+        n_kv_heads: int | None = None,
+    ):
         super().__init__()
         assert d_model % n_heads == 0, "d_model 必须能被 n_heads 整除"
 
-        self.d_model = d_model    # 768, 每个 token 的维度
-        self.n_heads = n_heads    # 12, 注意力头的数量
+        self.d_model = d_model  # 768, 每个 token 的维度
+        self.n_heads = n_heads  # 12, 注意力头的数量
         self.d_k = d_model // n_heads  # 64, 每个头处理的维度 (768÷12)
         self.use_rope = use_rope
 
@@ -110,9 +116,13 @@ class MultiHeadAttention(nn.Module):
         assert n_heads % self.n_kv_heads == 0, "n_heads 必须能被 n_kv_heads 整除"
 
         # Q/K/V 投影: Q 保持 n_heads, K/V 用 n_kv_heads (GQA 时更少)
-        self.w_q = nn.Linear(d_model, n_heads * self.d_k)        # (768 → 768)
-        self.w_k = nn.Linear(d_model, self.n_kv_heads * self.d_k)  # (768 → n_kv_heads×64)
-        self.w_v = nn.Linear(d_model, self.n_kv_heads * self.d_k)  # (768 → n_kv_heads×64)
+        self.w_q = nn.Linear(d_model, n_heads * self.d_k)  # (768 → 768)
+        self.w_k = nn.Linear(
+            d_model, self.n_kv_heads * self.d_k
+        )  # (768 → n_kv_heads×64)
+        self.w_v = nn.Linear(
+            d_model, self.n_kv_heads * self.d_k
+        )  # (768 → n_kv_heads×64)
         self.w_o = nn.Linear(d_model, d_model)  # 把多头结果融合回 768 维
         self.dropout = nn.Dropout(dropout)
 
@@ -312,17 +322,20 @@ class MultiHeadAttention(nn.Module):
         # ═══ Step 1: 线性投影 —— 把输入变成 Q/K/V 三种角色 ═══
         # 三个不同的 Linear 层，各自学习不同的投影方式
         # 输入都是 (B, seq, 768)，输出也是 (B, seq, 768)，但语义不同
-        q = self.w_q(query)   # "提问者"视角
-        k = self.w_k(key)     # "被查询者"视角
-        v = self.w_v(value)   # "内容提供者"视角
+        q = self.w_q(query)  # "提问者"视角
+        k = self.w_k(key)  # "被查询者"视角
+        v = self.w_v(value)  # "内容提供者"视角
 
         # ═══ Step 2: 拆成多头 ═══
         # Q 拆成 n_heads 个: (B, seq, 768) → (B, seq, n_heads, d_k)
         # K/V 拆成 n_kv_heads 个: (B, seq, 768) → (B, seq, n_kv_heads, d_k)
         #   标准 MHA: n_kv_heads = n_heads = 12
         #   GQA: n_kv_heads = 3, 只有 3 套 K/V，后续重复 4 次匹配 Q
+        #
         q = q.view(batch_size, -1, self.n_heads, self.d_k)
-        k = k.view(batch_size, -1, self.n_kv_heads, self.d_k)
+        k = k.view(
+            batch_size, -1, self.n_kv_heads, self.d_k
+        )  # 如果是gqa，n_kv_heads=3，k的形状是 (B, seq, 3, 64)
         v = v.view(batch_size, -1, self.n_kv_heads, self.d_k)
 
         # ═══ Step 3: transpose —— 让 12 个头变成 12 个独立任务 ═══
@@ -410,6 +423,7 @@ class MultiHeadAttention(nn.Module):
         # 生成新 token 时，不需要重新计算之前所有 token 的 K 和 V
         # 把之前缓存的 K/V 和新的 K/V 拼起来
         # 注意: KV-Cache 保存的是原始 n_kv_heads 的 K/V，不重复
+        # 先拼接新token的 kv到kvcache 然后用新q查询 kvcache
         if kv_cache is not None:
             k_prev, v_prev = kv_cache
             k = torch.cat([k_prev, k], dim=2)  # 沿 seq_len 维度拼接
