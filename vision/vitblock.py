@@ -232,12 +232,15 @@ class PatchEmbedding(nn.Module):
         pad_h = (self.patch_size - H % self.patch_size) % self.patch_size
         pad_w = (self.patch_size - W % self.patch_size) % self.patch_size
         if pad_h > 0 or pad_w > 0:
+            # pad函数的参数是 (left, right, top, bottom)，这里我们只在右和下补零
+            # 给x上下左右补像素为了适配patch大小，pad_h是下边补的像素数，pad_w是右边补的像素数
             x = F.pad(x, (0, pad_w, 0, pad_h))
 
         x = self.projection(x)        # (B, d_model, H_p, W_p)
         B, C, H_p, W_p = x.shape
         x = x.flatten(2)              # (B, d_model, H_p * W_p)
         x = x.transpose(1, 2)         # (B, num_patches, d_model)
+        # 上面之后x就是和文字的形状一样了
         return x, (H_p, W_p)
 
 
@@ -406,7 +409,8 @@ class ViTBlock(nn.Module):
         # query = key = value
         # grid_size 传给 attention，如果配置了 window_size 就启用窗口注意力
         x = x + self.dropout1(
-            self.self_attn(normed, normed, normed, mask=None, grid_size=grid_size)
+            self.self_attn(normed, normed, normed,
+                           mask=None, grid_size=grid_size)
         )
 
         # --- 前馈网络子层 ---
@@ -649,6 +653,19 @@ class VisionLanguageModel(nn.Module):
         文字(10)  │   全1    │  下三角  │   ← 文字看图像: OK；文字看文字: 因果
                   └──────────┴──────────┘
 
+    展开示例 (2 图像 patch + 2 文字 token):
+
+              img0  img1  txt0  txt1
+            ┌─────┬─────┬─────┬─────┐
+      img0  │  1  │  1  │  0  │  0  │   ← 图像互相可见，不看文字
+            ├─────┼─────┼─────┼─────┤
+      img1  │  1  │  1  │  0  │  0  │
+            ├─────┼─────┼─────┼─────┤
+      txt0  │  1  │  1  │  1  │  0  │   ← 文字看图像全可见，看自己因果
+            ├─────┼─────┼─────┼─────┤
+      txt1  │  1  │  1  │  1  │  1  │   ← txt1 能看到 img0/img1/txt0
+            └─────┴─────┴─────┴─────┘
+
     代码实现:
       1. 先构造一个标准的下三角 causal mask (207, 207)
       2. 把"图像看文字"的区域（前 197 行，后 10 列）设为 0
@@ -790,6 +807,9 @@ class VisionLanguageModel(nn.Module):
         # ─── 拼接：[图像 tokens | 文本 tokens] ───
         # 这是多模态的核心：图像和文字在同一个序列里
         # 它们通过自注意力自然交互——文字 token 会 attend 到图像 token
+        # dim=1 是拼再seqlen上吗？是的，dim=1 表示在序列长度的维度上拼接。具体来说：
+        # image_embeds: (B, num_image_tokens, d_model)
+        # text_embeds:  (B, text_len, d_model)
         combined = torch.cat([image_embeds, text_embeds], dim=1)
 
         total_len = combined.size(1)
@@ -814,7 +834,10 @@ class VisionLanguageModel(nn.Module):
         x = self.decoder.norm(x)
 
         # ─── 输出投影 ───
+        # output_proj 是一个线性层，把 Decoder 的输出映射到词表大小，预测下一个词的分数。
         logits = self.output_proj(x)  # (B, num_patches + text_len, vocab_size)
+        # logits是什么东西？它是模型对每个位置（图像 token 和文字 token）预测下一个词的分数。
+        # 维度是 (B, N_img + T, vocab_size)，
         return logits
 
     def get_num_image_tokens(self, pixel_values: torch.Tensor | None = None) -> int:
