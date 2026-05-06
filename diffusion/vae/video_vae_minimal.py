@@ -383,45 +383,84 @@ class SimpleVideoVAE(nn.Module):
         """
         编码视频到 latent（训练用，带随机采样）。
 
+        完整流程:
+            x (B,3,8,64,64)
+              ↓
+            Encoder3D → h (B,8,4,8,8)
+              ↓
+            chunk(2, dim=1) → mu (B,4,4,8,8) + logvar (B,4,4,8,8)
+              ↓
+            重参数化: z = μ + σ·ε,  ε~N(0,I)
+              ↓
+            z (B,4,4,8,8)
+
+        ═══════════════════════════════════════════════════════════════════════
+        【重参数化技巧（Reparameterization Trick）】
+        ═══════════════════════════════════════════════════════════════════════
+
+        问题: 从 N(μ,σ²) 采样这个操作本身不可导，梯度无法回传。
+
+        解决: z = μ + σ·ε，其中 ε ~ N(0, I) 是固定的随机噪声。
+              现在梯度可以沿 μ 和 σ 回传（ε 视为常数），实现端到端训练。
+
+        数学:
+            σ = exp(0.5 · logvar)    ← 从 logvar 还原标准差
+            ε ~ N(0, I)              ← 标准正态随机数
+            z = μ + σ ⊙ ε            ← ⊙ 表示逐元素乘法
+
+        直观:
+            μ 是"中心位置"，σ 是"扩散程度"，ε 是"随机偏移"。
+            z 就是从以 μ 为中心、σ 为分散程度的高斯分布中采样的点。
+
         参数:
             x: (B, 3, T, H, W) — 原始视频
 
         返回 dict:
             z:      (B, 4, T', H', W') — 采样后的 latent
-            mu:     (B, 4, T', H', W') — 均值
-            logvar: (B, 4, T', H', W') — log 方差
+            mu:     (B, 4, T', H', W') — 均值 μ
+            logvar: (B, 4, T', H', W') — log 方差 log(σ²)
         """
         h = self.encoder(x)  # (B, 8, T', H', W')
 
-        # TODO(human): 把 h 拆成 mu 和 logvar，然后做重参数化采样
-        #
-        # 提示:
-        #   1. h 的形状是 (B, 8, T', H', W')，前4通道是 mu，后4通道是 logvar
-        #   2. 用 torch.chunk(2, dim=1) 把 h 拆成两份
-        #   3. 重参数化: z = mu + exp(0.5 * logvar) * eps, 其中 eps ~ N(0, I)
-        #   4. eps 可以用 torch.randn_like(std) 生成
-        #
-        # 你的代码写在这里:
-        # --------------------------------------------------------
-        # mu, logvar = ...
-        # std = ...
-        # eps = ...
-        # z = ...
-        # --------------------------------------------------------
+        # 把 (B, 8, T', H', W') 沿通道维(dim=1)拆成两份
+        # 前4通道 = mu(均值)，后4通道 = logvar(log方差)
+        mu, logvar = h.chunk(2, dim=1)
 
+        # 重参数化采样: z = μ + σ·ε
+        # Step 1: 从 logvar 计算标准差 σ = exp(0.5 * logvar)
+        std = (0.5 * logvar).exp()
+
+        # Step 2: 生成标准正态随机数 ε ~ N(0, I)，和 std 同形状
+        eps = torch.randn_like(std)
+
+        # Step 3: z = μ + σ·ε，从 N(μ, σ²) 采样
+        z = mu + std * eps
         return {"z": z, "mu": mu, "logvar": logvar}
 
     def encode_deterministic(self, x: torch.Tensor) -> torch.Tensor:
         """
         确定性编码（推理/DiT训练用）。
 
-        与 encode() 的区别:
-          - encode() 用于训练，从 N(μ,σ²) 采样，引入随机性
-          - encode_deterministic() 用于推理，直接返回 μ，没有随机性
+        ═══════════════════════════════════════════════════════════════════════
+        【为什么推理时不需要随机采样？】
+        ═══════════════════════════════════════════════════════════════════════
 
-        为什么推理时不需要采样？
-          因为 VAE 训练好后，KL loss 已经把 latent 分布压到了接近 N(0,1)。
-          μ 就是分布的均值（最可能的点），直接用 μ 比采样更稳定。
+        训练时采样(z = μ + σ·ε)的目的是让Encoder输出一个分布N(μ,σ²)，
+        而不是一个固定点。这样Decoder学会的是"从分布中采样都能重建"，
+        使得latent空间连续且规则。
+
+        推理时，VAE已经训练好了，KL loss把分布压到了接近N(0,1)。
+        μ就是这个分布的均值——最可能、最稳定的点。
+        采样会引入随机性，导致同一段视频每次编码结果不同，不稳定。
+
+        对比:
+            encode():          z = μ + σ·ε   ← 有随机性，每次结果不同
+            encode_deterministic(): z = μ      ← 固定，每次结果相同
+
+        使用场景:
+            - DiT训练: 需要稳定的z_0作为训练目标
+            - 视频重建: 需要一致的编码结果
+            - 视频编辑: 基于确定的latent做操作
 
         参数:
             x: (B, 3, T, H, W) — 原始视频
@@ -429,20 +468,9 @@ class SimpleVideoVAE(nn.Module):
         返回:
             z: (B, 4, T', H', W') — 确定性 latent
         """
-        # TODO(human): 实现确定性编码
-        #
-        # 提示:
-        #   1. 先用 self.encoder(x) 得到 h
-        #   2. 把 h 拆成 mu 和 logvar（和 encode() 一样）
-        #   3. 直接返回 mu，不做采样
-        #
-        # 你的代码写在这里:
-        # --------------------------------------------------------
-        # h = ...
-        # mu = ...
-        # return mu
-        # --------------------------------------------------------
-        pass  # 替换这行
+        h = self.encoder(x)                 # (B, 8, T', H', W')
+        mu, _ = h.chunk(2, dim=1)           # 拆成 mu(前4通道) 和 logvar(后4通道)
+        return mu                            # 直接返回 mu，不采样
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
         """从 latent 解码回视频。"""
@@ -452,14 +480,41 @@ class SimpleVideoVAE(nn.Module):
         """
         训练用的完整前向传播。
 
+        ═══════════════════════════════════════════════════════════════════════
+        【VAE 训练流程】
+        ═══════════════════════════════════════════════════════════════════════
+
+        Step 1: 编码
+            x (原始视频)
+              ↓ Encoder3D
+            h = (μ, logvar)  ← 分布参数
+              ↓ 重参数化
+            z = μ + σ·ε      ← 采样的 latent
+
+        Step 2: 解码
+            z (latent)
+              ↓ Decoder3D
+            x̂ (重建视频)
+
+        Step 3: 计算损失
+            L_recon = MSE(x̂, x)           ← 重建误差（像不像原视频）
+            L_kl    = KL(N(μ,σ²) ‖ N(0,1))  ← 分布正则化（让latent规整）
+            L_total = L_recon + β · L_kl    ← β 很小(如1e-4)，平衡两者
+
+        为什么需要 KL loss？
+            没有 KL: Encoder 可能把每个视频编码成很远很散的点，
+                    latent 空间不规则，DiT 无法从噪声生成。
+            有 KL:   强迫所有视频的 latent 都聚集在 N(0,1) 附近，
+                    latent 空间连续、规则，适合扩散模型采样。
+
         参数:
             x: (B, 3, T, H, W) — 原始视频
 
         返回 dict:
-            recon:  (B, 3, T, H, W) — 重建视频
-            z:      latent
-            mu:     均值
-            logvar: log 方差
+            recon:  (B, 3, T, H, W) — 重建视频 x̂
+            z:      (B, 4, T', H', W') — 采样后的 latent
+            mu:     (B, 4, T', H', W') — 均值 μ
+            logvar: (B, 4, T', H', W') — log 方差
         """
         enc = self.encode(x)
         recon = self.decode(enc["z"])
@@ -476,7 +531,38 @@ class SimpleVideoVAE(nn.Module):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def kl_divergence(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-    """KL(N(μ,σ²) ‖ N(0,1)) = -½ Σ(1 + logσ² - μ² - σ²)"""
+    """
+    计算 KL 散度: KL(N(μ, σ²) ‖ N(0, 1))。
+
+    ═══════════════════════════════════════════════════════════════════════
+    【数学推导】
+    ═══════════════════════════════════════════════════════════════════════
+
+    对于一维高斯分布 N(μ, σ²) 和标准正态 N(0, 1):
+
+        KL(N(μ,σ²) ‖ N(0,1)) = ∫ p(x) log(p(x)/q(x)) dx
+
+    推导后得到解析解:
+        KL = ½ [ μ² + σ² - 1 - log(σ²) ]
+
+    因为代码里存的是 logvar = log(σ²)，所以:
+        σ² = exp(logvar)
+
+        KL = ½ [ μ² + exp(logvar) - 1 - logvar ]
+
+    代码实现（取负号，等价变形）:
+        KL = -½ [ 1 + logvar - μ² - exp(logvar) ]
+
+    对所有位置求平均，得到一个标量损失。
+
+    参数:
+        mu:     (B, C, T, H, W) — 均值 μ
+        logvar: (B, C, T, H, W) — log 方差 log(σ²)
+
+    返回:
+        标量 — batch 平均 KL 散度
+    """
+    # KL = -0.5 * Σ(1 + log(σ²) - μ² - σ²)
     kl = -0.5 * (1.0 + logvar - mu.pow(2) - logvar.exp())
     return kl.mean()
 
@@ -488,7 +574,46 @@ def vae_loss(
     logvar: torch.Tensor,
     kl_weight: float = 1e-4,
 ) -> dict[str, torch.Tensor]:
-    """VAE 总损失 = 重建损失 + KL 权重 × KL 散度"""
+    """
+    VAE 总损失函数。
+
+    ═══════════════════════════════════════════════════════════════════════
+    【损失组成】
+    ═══════════════════════════════════════════════════════════════════════
+
+    总损失 = 重建损失 + β × KL 散度
+
+    ┌─────────────────────────────────────────────────────────────────────┐
+    │  L_recon = MSE(recon, target)                                      │
+    │                                                                     │
+    │    重建误差：让 Decoder 能从 latent 还原出原视频。                  │
+    │    没有它：VAE 可以随便编码，latent 毫无意义。                      │
+    │                                                                     │
+    │  L_kl = KL(N(μ,σ²) ‖ N(0,1))                                       │
+    │                                                                     │
+    │    分布正则化：强迫 latent 接近标准正态 N(0,1)。                    │
+    │    没有它：latent 空间不规则，DiT 无法从噪声生成。                  │
+    │                                                                     │
+    │  L_total = L_recon + β × L_kl                                      │
+    │                                                                     │
+    │    β 是平衡系数。                                                   │
+    │    β 太大 → latent 被压到 N(0,1)，但重建质量差（信息丢失太多）。   │
+    │    β 太小 → latent 空间不规则，DiT 生成质量差。                     │
+    │    典型值: β = 1e-4 ~ 1e-6                                          │
+    └─────────────────────────────────────────────────────────────────────┘
+
+    参数:
+        recon:     (B, 3, T, H, W) — 重建视频 x̂
+        target:    (B, 3, T, H, W) — 原始视频 x
+        mu:        (B, 4, T', H', W') — 编码均值
+        logvar:    (B, 4, T', H', W') — 编码 log 方差
+        kl_weight: float — KL 损失权重 β
+
+    返回 dict:
+        total:      标量 — 总损失
+        recon_loss: 标量 — 重建损失
+        kl_loss:    标量 — KL 散度
+    """
     recon_loss = F.mse_loss(recon, target)
     kl_loss = kl_divergence(mu, logvar)
     total = recon_loss + kl_weight * kl_loss
@@ -537,3 +662,38 @@ if __name__ == "__main__":
     print(f"  total:      {losses['total'].item():.4f}")
 
     print("\n✓ 所有测试通过！")
+
+    print("\n" + "=" * 60)
+    print("测试 5: 小训练演示（10 个 epoch）")
+    print("=" * 60)
+
+    # 构造"假"训练数据：随机噪声视频，让 VAE 学会重建
+    # 真实场景应换成你的视频数据集
+    torch.manual_seed(42)
+    train_videos = torch.randn(8, 3, 8, 64, 64)  # 8 段视频
+
+    vae_train = SimpleVideoVAE()
+    optimizer = torch.optim.Adam(vae_train.parameters(), lr=1e-3)
+
+    for epoch in range(10):
+        optimizer.zero_grad()
+
+        # 取全部数据做一个小 batch（真实场景用 DataLoader）
+        out = vae_train(train_videos)
+
+        # 计算损失
+        losses = vae_loss(
+            out["recon"], train_videos,
+            out["mu"], out["logvar"],
+            kl_weight=1e-4,
+        )
+
+        losses["total"].backward()
+        optimizer.step()
+
+        # 每 2 个 epoch 打印一次
+        if epoch % 2 == 0 or epoch == 9:
+            print(f"  Epoch {epoch+1:2d}: recon={losses['recon_loss'].item():.4f}, "
+                  f"kl={losses['kl_loss'].item():.6f}, total={losses['total'].item():.4f}")
+
+    print("\n✓ 训练演示完成！注意：这是假数据，真实场景 loss 收敛会更明显。")
